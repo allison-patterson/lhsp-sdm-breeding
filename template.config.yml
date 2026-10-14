@@ -1,0 +1,3 @@
+default:
+  java_loc: '<YourFilepath>/OpenJDK/jdk-xx'
+  cms_env: '<YourFilepath>/cms_env'
