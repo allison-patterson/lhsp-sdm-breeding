@@ -1,4 +1,3 @@
-# atl_lhsp_gps_sdm
 
 This repository archives the analyses included in the following paper:
 
