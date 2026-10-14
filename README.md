@@ -5,7 +5,7 @@ This repository archives the analyses included in the following paper:
 
 ## Interactive results
 
-Explore the model predictions in the [**[Leach's storm-petrel at-sea species distribution model predictions](https://allison-patterson-lhsp-sdm-viz.share.connect.posit.cloud/)**].
+Leach's storm-petrel at-sea species distribution model predictions can be explored using this **[link](https://allison-patterson-lhsp-sdm-viz.share.connect.posit.cloud/)**.
 Select one or more colonies, breeding stages, and behavioural risk categories, plus the month and time of day, to view rasters of the number of birds at sea.
 
 ## Contents
