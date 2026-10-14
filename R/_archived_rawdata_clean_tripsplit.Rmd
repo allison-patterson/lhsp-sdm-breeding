@@ -1,0 +1,790 @@
+---
+title: "Leach's storm petrel"
+subtitle: "Raw GPS data to cleaned and prepared dataset" 
+author: "Katharine Studholme, Isabeau Pratte"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html",  output_file="00_dataClean_HMMprep_raw.html") })
+output: html_document
+---
+
+
+This script is the work flow we followed to get a cleaned and prepared dataset, starting from the original raw (.pos) data. 
+
+These raw .pos data files are not archived in this paper's Zenodo repository. Instead, the tracking data are made available via the Movebank data repository (https://www.movebank.org/cms/movebank-content/data-repository), with one data package per colony:
+
+Baccalieu Island, NL, https://doi.org/10.5441/001/1.757; Bon Portage Island, NS, https://doi.org/10.5441/001/1.759; Country Island, NS, https://doi.org/10.5441/001/1.760;  Gull Island, NL, https://doi.org/10.5441/001/1.761; Kent Island, NB, https://doi.org/10.5441/001/1.762; Middle Lawn Island, NL, https://doi.org/10.5441/001/1.763.”
+
+These Movebank data packages contain cleaned GPS data, clipped to the deployment period. The cleaning criteria and deployment period definitions used to prepare the data for Movebank are identical to those used in the script below, which we used for our manuscript. The Movebank data could be used to replicate our work, feeding into this script at the step where trips are identified (line 186; trips not yet identified in the Movebank data). However, the column names and formats in the Movebank dataset are not identical to those used in this script, changed to meet the requirements of that database.
+
+In addition, the Movebank data package for Baccalieu Island contains tracking data from one bird that was not included in our manuscript (band = 296101414, tagID = 57639). Data from this tag was not available when we performed the analysis for this paper.
+
+Because of the challenges identified above, our analysis is not fully reproducible starting from the original tag downloads (.pos files). We apologize for this. However, we do provide the final foraging trips dataset (data_tripSplit_df.rds) that results from this script in the Zenodo repository so the analysis is reproducible from that point forward. This script is archived simply to document the initial cleaning and trip definitions process that was followed.
+
+```{r setup, include=T, echo = T, message = F, warning = F}
+
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, include = F, message = F, warning = F, tidy = T, tidy.opts = list(width.cutoff = 80))
+
+renv::restore(lockfile = here::here('renv.lock'))
+
+library(dplyr)
+library(lubridate)
+library(track2KBA)
+
+tagMetadata <- here::here("input_data/MasterMetadata_LHSP_Tracking_NL_NB_NS_13Aug2024_GPSonly.csv")
+colonyCoord <- here::here("input_data/colony.csv")
+
+if (dir.exists(here::here('output_data/clean_data/rdata')) == FALSE) dir.create(here::here('output_data/clean_data/rdata'), recursive = T)
+output_rdata <- here::here('output_data/clean_data/rdata')
+
+if (dir.exists(here::here('output_data/clean_data/png')) == FALSE) dir.create(here::here('output_data/clean_data/png'), recursive = T)
+output_png <- here::here('output_data/clean_data/png')
+
+if (dir.exists(here::here('output_data/clean_data/csv')) == FALSE) dir.create(here::here('output_data/clean_data/csv'), recursive = T)
+output_csv <- here::here('output_data/clean_data/csv')
+
+```
+
+# Import and clean the raw data
+
+## Import the .pos files 
+
+Import files as a list of datasets and transform this list of datasets into a useable dataframe containing all the data. Then combine the raw data with their associated metadata (using 'track_filename'). 
+
+Metadata includes breeding status (incubation vs chick rearing). All are based on recorded burrow contents except 2017 field stints at Bon Portage (6 July) and Country (20-28 June). We do have records of chicks in burrows on 8 July at Kent and Machias Seal, but we assume here that the field stints mentioned above were targeting birds with eggs (labeled as incubation in the metadata).
+
+``` {r, include = T}
+
+# Column names of the .pos file
+cnames <- c("day", "month", "year", "hour", "minute", "second", "secondOfDay", "satellites", "latitude", "longitude", "altitude", "clockOffset", "accuracy", "voltage")
+
+# read .pos tracking datasets from most up-to-date folder
+temp <- list.files(path = here::here("raw_data/raw_gps_data"), pattern = "*.pos", full.names = T)
+
+data_list <- lapply(temp, function(x) read.delim(x, header = F, skip = 5,  quote = "", sep = c(","), col.names = cnames))
+
+# Here you get the name and path of all the .pos files
+names(data_list) <- temp  
+
+# transform the list of datasets into a big dataframe
+data <- as.data.frame(do.call(rbind, data_list))
+
+data <- tibble::rownames_to_column(data, var = "file") |> # variable with the original file path
+  mutate(StudholmeLocalPath = gsub("(.pos)\\..*", "\\1", file), 
+      
+      track_filename = paste("Obs", sub(".*Obs", "", StudholmeLocalPath), sep = ""),
+      
+      filename = substring(track_filename, 1, 25)) # get rid of .pos in filename
+
+```
+
+
+## Import the metadata 
+
+``` {r, include = T}
+
+# Import the Metadata
+
+metaForGPS <- read.csv(tagMetadata) |>
+  mutate(status = ifelse(dep_brStatus == "chick rearing", "chick-rearing", dep_brStatus),
+      filename = substring(track_filename, 1, 25)) # get rid of .pos in filename
+
+# Gull Island has two 'bird only' contents at deploy (status = "none", leave these out)
+# BP 2017, July 6, and Country 2017, June 20-28; (status = NA, ok to assume incubation)
+metaForGPS <- metaForGPS |>
+  mutate(status = ifelse(is.na(status), "incubation", status))
+
+
+metaForJoin <- metaForGPS |> dplyr::select(colony, tagProg, band, sex, dep_yr, dep_mo, dep_date, status, ret_tagYN, ret_date, filename, dep_datetimeUTC, tagProgStartUTC, track_dataStart, ret_datetimeUTC, track_dataEnd) |> # Keep variables relevant to add to the tracking data
+  dplyr::filter(filename != "")
+
+
+dataWid <- left_join(data, metaForJoin, by = "filename") # Join metadata to data to get colony and year
+
+# Make unique ID. There will not be any birds (bands) with GPS deployed more than once per year. Colony not necessary but useful to have.
+data <- dataWid |> 
+  mutate(id = paste(colony, dep_yr, band, sep = ".")) 
+
+```
+
+## Clip data to deployment period
+
+``` {r, include = T}
+
+# Start: Clip by dep_datetime, progStart, track_dataStart
+# End: Clip by ret_datetime, ret_date at 6am local time day retrieved, track_dataEnd (for >1yr tags)
+
+data <- data |>
+  mutate(TrackTime = dmy_hms(paste(paste(day, month, year, sep = "/"), paste(hour, minute, second, sep = ":"), sep = " ")),
+         ret_dateDawn = ifelse(!is.na(ret_date) & colony %in% c("Kent", "Bon Portage", "Country"), as.character(with_tz(as.POSIXct(paste(ret_date, "06:00:00"), format = "%Y-%m-%d %H:%M:%S", tz = "Canada/Atlantic"), tz = "UTC")),
+                               ifelse(!is.na(ret_date), as.character(with_tz(as.POSIXct(paste(ret_date, "06:00:00"), format = "%Y-%m-%d %H:%M:%S", tz = "Canada/Newfoundland"), tz = "UTC")), NA)),
+         dep_datetimeEst = as.POSIXct(ifelse(!is.na(dep_datetimeUTC), dep_datetimeUTC,
+                                  ifelse(!is.na(tagProgStartUTC), tagProgStartUTC, track_dataStart)), format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+         ret_datetimeEst = as.POSIXct(ifelse(!is.na(ret_datetimeUTC), ret_datetimeUTC, 
+                                  ifelse(!is.na(ret_dateDawn), ret_dateDawn, track_dataEnd)), format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+         deployed = ifelse(TrackTime > dep_datetimeEst & TrackTime < ret_datetimeEst, "y", "n")) |>
+  filter(deployed == "y")
+
+# Keep only relevant variables
+data <- data |> dplyr::select(colony, id,  tagProg, band, dep_yr, day, month, year, hour, minute, second, satellites, voltage, latitude, longitude, filename, track_filename, sex, status, TrackTime) |>
+  dplyr::rename("ID" = id, "Year" = dep_yr)
+
+# Import the colony df that includes colony names and coordinates
+# Only working with Canada here. Consider adding encoding to read Icelandic properly. 
+colonyLHSP <- read.csv(colonyCoord) |> dplyr::rename("lat.col" = lat, "lon.col" = lon) # important for the track split function
+
+# add colony coordinates to df, this is required for further tripSplit function
+data <- left_join(data, colonyLHSP, by = "colony") 
+
+remove(colonyLHSP)
+
+length(unique(data$ID)) # just double check I get the right total number of individuals. Should be 467
+
+```
+
+## Adjust the (0,0) coordinates
+
+There are many 0,0 coordinates, sometimes because the bird is in its burrow, or because of low battery voltage, or other times because no (or not enough) satellites were available in the middle of a trip
+
+Satellites > 0 correspond to failed location attempts at sea
+Satellites == 0 indicate burrow use (at the colony lon,lat)
+
+Then check to see if previous or next position from each 0 satellite case is far from the colony (>100km to correspond with return buffer in tripSplit). If point either before or after is far from the colony, re-assign that position to NA (assume bird is at sea with bad fix).
+
+
+``` {r, include = T}
+
+data <- mutate(data, longitude = ifelse(longitude == 0 & satellites != 0, NA,
+                                                    ifelse(longitude != 0, longitude, lon.col)), # 0 lon & 0 sats gets colony lon, others with 0 lon get NA
+                 latitude = ifelse(latitude == 0 & satellites != 0, NA, 
+                                   ifelse(latitude != 0, latitude, lat.col))) |>
+  # Add colony distance variable. Should get 0s for burrow use cases.
+  mutate(ColDist = geosphere::distHaversine(matrix(c(lon.col, lat.col), ncol = 2),
+                matrix(c(longitude, latitude), ncol = 2)),
+         longitude = ifelse(satellites == 0 & (lead(ColDist, 1) > 100000 | lag(ColDist, 1) > 100000), NA, longitude), 
+         latitude = ifelse(satellites == 0 & (lead(ColDist, 1) > 100000 | lag(ColDist, 1) > 100000), NA, latitude)) |>
+  filter(!is.na(longitude)) |>
+  droplevels() |>
+  distinct()
+
+# Save the raw and cleaned dataset, with added metadata in .rds
+saveRDS(data, paste0(output_rdata, "/data_Raw_cleaned_withCol.rds"))
+
+```
+
+```{r, echo = F}
+
+head(data, 5) |>
+  kbl(align = "l", digits = 2, caption = "Cleaned raw data", booktabs = T) |>
+  kable_styling(full_width = F, position = "left", latex_options = "scale_down")
+	
+```
+
+Visual of all locations
+
+``` {r, include = T, echo = T}
+
+plot(latitude~longitude, data=data, asp=1)
+maps::map("world", add=T)
+
+```
+
+## Split data into foraging trips for each individual using package 'track2KBA'
+
+Format fields so it works with the tripSplit function using the formatFields function
+
+``` {r, include = T}
+
+dataGroup <- formatFields(
+  dataGroup = data, 
+  fieldID   = "ID", 
+  fieldDateTime = "TrackTime", 
+  fieldLon  = "longitude", 
+  fieldLat  = "latitude"
+  )
+
+# Calculate difference in time between location (to be used later)
+dataGroup <- dataGroup |> group_by(ID) |> mutate(diffTime = abs(round_date(DateTime, unit = "hours") - lead(round_date(DateTime, unit = "hours")))) |>
+  filter(diffTime != 0) |> distinct(colony, ID, DateTime, .keep_all = T) |> ungroup() 
+
+```
+
+Location of colonies for the tripSplit function
+
+``` {r, include = T}
+
+colonies <- distinct(data, colony, ID, lat.col, lon.col) |> dplyr::rename("Latitude" = lat.col, "Longitude" = lon.col) # Rename so it works with tripSplit function
+
+``` 
+
+## tripSplit function
+
+Used different thresholds for incubating and chick-rearing birds because their pattern of return to colony is different, i.e., chick-rearing birds sometimes seem to go only briefly to the colony before heading back so successive location can already be a substantial distance from the colony (e.g., 67 km), but it appears clear that those locations are part of different trips.
+
+Breeding status other than incubation and chick-rearing dropped at this step. Recall there are two breeding status = "none" and a number of breeding status = NA that we have assumed are incubation.
+
+``` {r, include = T}
+
+trips_inc <- tripSplit(
+  dataGroup  = subset(dataGroup, status == "incubation"),
+  colony     = colonies,
+  innerBuff  = 10,      # 10  kilometers for incubation
+  returnBuff = 100,
+  duration   = 2,      # hours
+  rmNonTrip  = FALSE,
+  nests = T
+  )
+
+trips_cr <- tripSplit(
+  dataGroup  = subset(dataGroup, status == "chick-rearing"),
+  colony     = colonies,
+  innerBuff  = 68,      # 68  kilometers for chick-rearing
+  returnBuff = 100,
+  duration   = 2,   
+  rmNonTrip  = FALSE,
+  nests = T
+  )
+
+trips <- rbind(trips_inc, trips_cr)
+
+saveRDS(trips, file = paste0(output_rdata, "/data_tripSplit.rds"))
+
+# Also save as regular dataframe to facilitate inspection of tripSplits
+data_tripSplitDraft_df <- as.data.frame(trips@data) 
+saveRDS(data_tripSplitDraft_df, file = paste0(output_rdata, "/data_tripSplitDraft_df"))
+remove(data_tripSplitDraft_df)
+
+```
+
+## Save visual of each draft trip in a folder, to inspect
+
+```{r, echo = F, eval =  F}
+
+if (dir.exists(here::here('output_data/clean_data/png/trips_draft')) == FALSE) dir.create(here::here('output_data/clean_data/png/trips_draft'))
+
+IDS <- sort(unique(trips@data$tripID))
+# remove -1, represents all points within tripSplit buffer
+IDS <- IDS[2:length(IDS)]
+
+for (i in 1:length(IDS)) {
+  id <- subset(trips@data, tripID == IDS[i])
+  colonyID <- subset(colonies, colony == id$colony[1])
+  windows(width=10, height=5)
+  # Add colony position to id dataset so it's always within the x and y limits
+  id2 <- plyr::rbind.fill(id, colonyID)
+  # Now plot
+  plot(Latitude~Longitude, data = id2, type = "o", asp = 1, main = paste0(id2$status[1], ", ", IDS[i]))
+  points(Latitude~Longitude, data = colonyID, type = "p", col = "red")
+  maps::map("world", add=T)
+  savePlot(file=(paste0(output_png, "/tripsDraft/", id2$status[1], " - ", IDS[i], '.png')), type = "png", device = dev.cur()) #for Windows users
+  dev.off()
+}
+
+```
+
+# Correct tripSplits, remove certain trips
+
+After the first run through this code, we (Katie Studholme, April Hedd) inspected plots of all trips prior to 2-hour interpolation. We noted a few trips that had not been split (assigned one tripID but containing several trips), a few short trips that did not look plausible (perfectly linear/inland), some extremely long trips associated with known storms or suspected reproductive failure, plus several cases where birds switched between incubation and chick-rearing during the tag deployment. April Hedd looked into each potential multi-trip by comparing animated tracks to the raw .pos data (to detect likely time in burrow, 0-0 coordinates) and defining new trip splits as necessary. 
+
+The inspection process and decisions are documented in "LHSP_GPS_2023_trips_toInspect.xlsx".
+
+We implement corrections here rather than following the original uninterpolated plotting step to minimize redundancy of code blocks. To recreate original uninterpolated plots, simply skip this code block.
+
+```{r, echo = F, eval = T}
+
+# Identify and remove problematic trips, those associated with storms, inland points, or those otherwise not characteristic of breeding behavior
+
+# Trips 
+badTrips <- c("Baccalieu - NE Light.2022.246113392_04", "Baccalieu - NE Light.2022.246113400_03", "Baccalieu - NE Light.2022.296101391_04", "Baccalieu - Ned Walsh.2022.246113383_07", "Bon Portage.2017.140172591_01", "Bon Portage.2022.170115333_04", "Country.2021.140147748_08", "Country.2021.140147753_05", "Country.2021.140147758_04", "Kent.2018.140167085_01", "Kent.2021.246109381_03", "Middle Lawn.2022.296101002_06", "Middle Lawn.2022.296101003_06", "Middle Lawn.2022.296101007_05", "Middle Lawn.2022.296101016_04", "Middle Lawn.2022.296101299_05")
+  
+trips <- trips[!trips$tripID %in% badTrips,] 
+
+## Remove tracks associated with likely breeding failures or unk breeding status
+
+badBreedStat <- c("Kent.2020.140173779_01", 
+                  "Bon Portage.2019.170115012_01", 
+                  "Bon Portage.2019.170115008_02", "Bon Portage.2019.170115008_03", "Bon Portage.2019.170115008_04", "Bon Portage.2019.170115008_05", "Bon Portage.2019.170115008_06", "Bon Portage.2019.170115008_07", "Bon Portage.2019.170115008_08", 
+                  "Baccalieu - Ned Walsh.2022.296101201_03", "Baccalieu - Ned Walsh.2022.296101201_04", "Baccalieu - Ned Walsh.2022.296101201_05", "Baccalieu - Ned Walsh.2022.296101201_06", "Baccalieu - Ned Walsh.2022.296101201_07")
+
+trips <- trips[!trips$tripID %in% badBreedStat,] 
+
+
+#### Implement trip-split revisions as per April Hedd's and Katie Studholme's recommendations, based on inspection of maps, pos files, and metadata. ####
+
+# Note that not all positions at the beginning of a trip are currently identified due to inner buffer (tripID = -1). These will be assigned to a trip later, if appropriate. This means that when reassigning breeding status, we need to make the change AFTER the last datetime in the previous trip (datetime of first record in burrow), not before the first datetime in the subsequent trip. This may label a series of points at the colony with a tripID, but this could be dropped later (if >1 on-colony location at start or end of trip, cut them. want to keep one to help with classifying whether or not the trip 'returns')
+
+
+# Baccalieu - Ned Walsh.2023.296101418_04 
+trips@data <- trips@data |>
+  mutate(tripID = ifelse(tripID == "-1", "-1", 
+                         ifelse(ID == "Baccalieu - Ned Walsh.2023.296101418" & DateTime >= as.POSIXct("24/07/2023 08:30:33", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Baccalieu - Ned Walsh.2023.296101418_07", 
+                                 ifelse(ID == "Baccalieu - Ned Walsh.2023.296101418" & DateTime >= as.POSIXct("21/07/2023 04:30:32", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Baccalieu - Ned Walsh.2023.296101418_06", 
+                         ifelse(ID == "Baccalieu - Ned Walsh.2023.296101418" & DateTime >= as.POSIXct("19/07/2023 06:30:32", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Baccalieu - Ned Walsh.2023.296101418_05", tripID)))),
+         status = ifelse(ID == "Baccalieu - Ned Walsh.2023.296101418" & DateTime > as.POSIXct("11/07/2023 02:30:38", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing", status))
+
+
+# Baccalieu - Ned Walsh.2023.296101419
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2023.296101419" & DateTime > as.POSIXct("19/07/2023 02:30:38", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing", 
+                         ifelse(ID == "Baccalieu - Ned Walsh.2023.296101419" & DateTime > as.POSIXct("13/07/2023 02:30:32", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - CR", status)),
+         # Seems like tripSplit got confused having only one line of 0 satellites. Correct tripID so first position after the 0 satellite case is associated with the next trip. Revisit why this happened?
+         tripID = ifelse(ID == "Baccalieu - Ned Walsh.2023.296101419" & DateTime == as.POSIXct("19/07/2023 04:30:38", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Baccalieu - Ned Walsh.2023.296101419_03", tripID))
+
+
+# Band 140171511
+trips@data <- trips@data |>
+  mutate(tripID = ifelse(tripID == "-1", "-1", 
+                         ifelse(ID == "Country.2017.140171511" & DateTime > as.POSIXct("24/06/2017 03:00:02", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Country.2017.140171511_02", tripID)))
+
+
+# Band 140173877
+trips@data <- trips@data |>
+  mutate(tripID = ifelse(tripID == "-1", "-1",
+                         ifelse(ID == "Country.2022.140173877" & DateTime >= as.POSIXct("05/09/2022 01:00:40", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Country.2022.140173877_05", 
+                         ifelse(ID == "Country.2022.140173877" & DateTime >= as.POSIXct("30/08/2022 01:00:30", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Country.2022.140173877_04",
+                                ifelse(ID == "Country.2022.140173877" & DateTime >= as.POSIXct("28/08/2022 03:00:28", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Country.2022.140173877_03", 
+                                       ifelse(ID == "Country.2022.140173877" & DateTime >= as.POSIXct("27/08/2022 09:00:28", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Country.2022.140173877_02",
+                                              ifelse(ID == "Country.2022.140173877" & DateTime < as.POSIXct("27/08/2022 09:00:28", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Country.2022.140173877_01", tripID)))))))
+
+
+# Band 246112831
+trips@data <- trips@data |>
+  mutate(tripID = ifelse(tripID == "-1", "-1", 
+                         ifelse(ID == "Gull.2018.246112831" & DateTime >= as.POSIXct("08/07/2018 02:30:22", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Gull.2018.246112831_02", tripID)))
+
+
+# Gull.2022.790112087
+trips@data <- trips@data |>
+  mutate(tripID = ifelse(tripID == "-1", "-1", 
+                         ifelse(ID == "Gull.2022.790112087" & DateTime >= as.POSIXct("13/08/2022 10:30:14", format = "%d/%m/%Y %H:%M:%S", tz = "UTC") & DateTime <= as.POSIXct("15/08/2022 22:30:14", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Gull.2022.790112087_06", 
+                                 ifelse(tripID == "Gull.2022.790112087_08", "Gull.2022.790112087_07",
+                                        ifelse(tripID == "Gull.2022.790112087_09", "Gull.2022.790112087_08",
+                                               ifelse(tripID == "Gull.2022.790112087_10", "Gull.2022.790112087_09",
+                                                      ifelse(tripID == "Gull.2022.790112087_11", "Gull.2022.790112087_10",
+                                                             ifelse(tripID == "Gull.2022.790112087_12", "Gull.2022.790112087_11", tripID))))))))
+
+
+# Band 140181955 
+trips@data <- trips@data |>
+  mutate(tripID = ifelse(tripID == "-1", "-1",
+                         ifelse(ID == "Kent.2018.140181955" & DateTime >= as.POSIXct("24/06/2018 03:10:30", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Kent.2018.140181955_02", tripID)))
+
+
+# Band 246109385
+trips@data <- trips@data |>
+  mutate(tripID = ifelse(tripID == "-1", "-1",
+                         ifelse(ID == "Kent.2021.246109385" & DateTime >= as.POSIXct("31/08/2021 09:12:21", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Kent.2021.246109385_03", 
+                         ifelse(ID == "Kent.2021.246109385" & DateTime >= as.POSIXct("28/08/2021 09:12:19", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Kent.2021.246109385_02",
+                                ifelse(ID == "Kent.2021.246109385" & DateTime < as.POSIXct("28/08/2021 09:12:19", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Kent.2021.246109385_01", tripID)))))
+
+
+####
+# Status Changes Only
+
+# Baccalieu - Ned Walsh.2023.296101413
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2023.296101413" & DateTime > as.POSIXct("12/07/2023 04:30:31", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Baccalieu - Ned Walsh.2023.296101413" & DateTime < as.POSIXct("12/07/2023 04:30:31", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - CR", status)))
+
+
+# Baccalieu - Ned Walsh.2023.296101429
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2023.296101429" & DateTime > as.POSIXct("11/07/2023 02:30:25", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing", status))
+
+
+# Gull.2018.246112827
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Gull.2018.246112827" & DateTime > as.POSIXct("11/07/2018 02:30:21", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - CR", status))
+
+
+# Band 790112070
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Gull.2022.790112070" & DateTime > as.POSIXct("13/07/2022 04:30:25", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Gull.2022.790112070" & DateTime <= as.POSIXct("13/07/2022 04:30:25", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status)))
+
+
+# Gull.2021.246111611
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Gull.2021.246111611" & DateTime > as.POSIXct("17/07/2021 03:40:32", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Gull.2021.246111611" & DateTime > as.POSIXct("11/07/2021 03:30:37", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - CR", status)))
+
+
+# Baccalieu - NE Light.2022.296101316
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - NE Light.2022.296101316" & DateTime > as.POSIXct("05/07/2022 04:30:35", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition", status))
+
+
+# Baccalieu - Ned Walsh.2022.296101208
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2022.296101208" & DateTime > as.POSIXct("11/07/2022 02:30:35", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status))
+
+
+# Baccalieu - Ned Walsh.2022.296101238
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2022.296101238" & DateTime > as.POSIXct("10/07/2022 02:30:25", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status))
+
+
+# Baccalieu - Ned Walsh.2022.296101241
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2022.296101241" & DateTime > as.POSIXct("16/07/2022 04:30:25", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Baccalieu - Ned Walsh.2022.296101241" & DateTime > as.POSIXct("12/07/2022 04:30:23", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - CR", status)))
+
+
+# Baccalieu - Ned Walsh.2022.296101207
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2022.296101207" & DateTime > as.POSIXct("10/07/2022 06:30:23", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status))
+
+
+# Baccalieu - Ned Walsh.2022.246113359
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2022.246113359" & DateTime > as.POSIXct("11/07/2022 04:30:34", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status))
+
+
+# Gull.2022.246111647
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Gull.2022.246111647" & DateTime > as.POSIXct("13/07/2022 04:30:31", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status))
+
+
+# Gull.2022.246111764
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Gull.2022.246111764" & DateTime > as.POSIXct("22/07/2022 02:30:25", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Gull.2022.246111764" & DateTime > as.POSIXct("14/07/2022 04:30:25", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status)))
+
+
+# Gull.2022.246111765
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Gull.2022.246111765" & DateTime > as.POSIXct("13/07/2022 04:30:22", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status))
+
+
+# Baccalieu - Ned Walsh.2023.296101417
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2023.296101417" & DateTime > as.POSIXct("12/07/2023 02:30:21", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status))
+
+
+# Baccalieu - Ned Walsh.2023.296101420
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2023.296101420" & DateTime > as.POSIXct("20/07/2023 02:30:38", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Baccalieu - Ned Walsh.2023.296101420" & DateTime > as.POSIXct("12/07/2023 02:30:29", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status)))
+
+
+# Baccalieu - Ned Walsh.2023.296101422
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2023.296101422" & DateTime > as.POSIXct("16/07/2023 04:30:34", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Baccalieu - Ned Walsh.2023.296101422" & DateTime > as.POSIXct("11/07/2023 02:30:30", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - Inc", status)))
+
+
+# Baccalieu - Ned Walsh.2023.296101423
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Baccalieu - Ned Walsh.2023.296101423" & DateTime > as.POSIXct("16/07/2023 00:30:14", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Baccalieu - Ned Walsh.2023.296101423" & DateTime > as.POSIXct("12/07/2023 02:30:22", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - CR", status)))
+
+
+# Gull.2023.246102967
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Gull.2023.246102967" & DateTime > as.POSIXct("15/07/2023 01:30:43", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Gull.2023.246102967" & DateTime > as.POSIXct("08/07/2023 03:30:34", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - CR", status)))
+
+
+# Gull.2023.246111646
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Gull.2023.246111646" & DateTime > as.POSIXct("16/07/2023 03:30:35", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - CR", status))
+
+
+# Gull.2023.306101139
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Gull.2023.306101139" & DateTime > as.POSIXct("19/07/2023 05:30:34", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing", status))
+
+
+# Gull.2023.246102965
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Gull.2023.246102965" & DateTime > as.POSIXct("20/07/2023 01:30:51", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Gull.2023.246102965" & DateTime > as.POSIXct("14/07/2023 01:30:42", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - CR", status)))
+
+
+# Middle Lawn.2023.308101207
+trips@data <- trips@data |>
+  mutate(status = ifelse(ID == "Middle Lawn.2023.308101207" & DateTime > as.POSIXct("11/07/2023 03:00:32", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "chick-rearing",
+                         ifelse(ID == "Middle Lawn.2023.308101207" & DateTime > as.POSIXct("06/07/2023 03:00:29", format = "%d/%m/%Y %H:%M:%S", tz = "UTC"), "Transition - CR", status)))
+
+
+## Re-save the tripSplit products
+saveRDS(trips, file = paste0(output_rdata, "/data_tripSplit.rds"))
+
+```
+
+
+## Reassign points within tripSplit thresholds to trip
+
+Note: For some birds, it looks like some -1 records don't get assigned back to trip by this code chunk - these are likely cases where the bird is milling around within the inner buffer area rather than going straight to its burrow. If interested in more detailed in/out of burrow behavior for future studies, you may want to use a different method of reassigning points within the inner buffer to specific trips. For the purposes of our LHSP SDM, we are most interested in foraging trips and will treat all points within the 10km buffer as 'on colony' (drop points within 10km before analysis).
+
+This code chunk ensures that locations that are below the tripSplit thresholds (tripID == -1, colDist < 10km (INC) or 68km (CR)) are assigned to their associated trip. 
+
+The innerBuffs are quite large, leaving out some locations that should be part of identified trips. This is because, as stated in the .pdf of the track2KBA package, "Note that [innerBuff] is ... the metric that determines whether two subsequent trips are split - if your animal records locations > innerBuff (km) from its place of origin and no locations at the place of origin (e.g. for burrow-nesting species) then subsequent trips may be lumped into a single trip. Increase innerBuff to ensure correct splitting of trips."
+
+The chunk below attributes the proper trip name to those locations that are < innerBuff but still belonging to a trip.
+
+
+``` {r, include = T}
+
+trips_keep <- trips
+
+trips_keep@data <- trips_keep@data |>
+  group_by(ID) |>
+  mutate(tripID_keep = ifelse(diffTime <= 14400 & ColDist != 0 & lead(tripID != -1) & lag(tripID == -1), lead(tripID), tripID),
+         tripID_keep = ifelse(diffTime <= 14400 & ColDist != 0 & lag(tripID != -1) & lead(tripID == -1), lag(tripID), tripID_keep),
+         
+         tripID_keep2 = ifelse(diffTime <= 14400 & ColDist != 0 & lead(tripID_keep != -1) & lag(tripID_keep == -1) & tripID_keep == -1, lead(tripID_keep), tripID_keep),
+         tripID_keep2 = ifelse(diffTime <= 14400 & ColDist != 0 & lag(tripID_keep != -1) & lead(tripID_keep == -1) & tripID_keep == -1, lag(tripID_keep), tripID_keep2),
+         
+         tripID_keep3 = ifelse(diffTime <= 14400 & ColDist != 0 & lag(tripID_keep2 != -1) & lead(tripID_keep2 == -1) & tripID_keep2 == -1, lag(tripID_keep2), tripID_keep2),
+         tripID_keep3 = ifelse(diffTime <= 14400 & ColDist != 0 & lead(tripID_keep2 != -1) & lag(tripID_keep2 == -1) & tripID_keep2 == -1, lead(tripID_keep2), tripID_keep3),
+         
+         tripID_keep4 = ifelse(tripID_keep3 == -1 & diffTime <= 14400 & lead(tripID_keep3) != -1, lead(tripID_keep3), tripID_keep3)) |>
+  
+           group_by(ID) |>
+         arrange(ID, DateTime) |> 
+         mutate(Returns = ifelse(ColDist == 0 & lag(ColDist >=100000), "No", Returns), # Define trips not returning if last location is >= 100 km away from colony
+                tripID = ifelse(ColDist == 0, "-1", tripID_keep4))  |> 
+  filter(tripID != -1) |> # Remove locations not part of a trip
+  droplevels() |> 
+  ungroup()  
+
+# Alternative is to add a filter for the on-colony location where the distance from colony of the second position after departure is beyond the colDist threshold for incomplete trips.
+trips_keep@data <- trips_keep@data |>
+  group_by(tripID) |>
+  mutate(badStart = ifelse(ColDist == 0 & lead(ColDist > 100000), "yes", "no")) |>
+  filter(badStart == "no")
+
+trips_keep@data <- trips_keep@data[, c(1:29)] # Keep the relevant variables
+
+# Remove trips with less than 5 relocations (min trip length 8 hours)
+trips_keep <- trips_keep[!trips_keep$tripID %in% names(which(table(trips_keep$tripID) < 5)),] 
+
+```
+
+## Remove erratic locations 
+
+Some locations are just erratic, way off track. Based on plot and histogram inspections, reasonable looking positions (consistent with smooth trajectories) reached speeds of ~66kph and reasonable positions during known storm events reached top speed of 105kph.
+
+We use 110 kph as max speed, plus a much more conservative speed filter of 50 kph in cases where satellites <=4 but >0 (poor reception).
+
+```{r, eval = T, include = T}
+
+trips_keep@data <- trips_keep@data |>
+  arrange(tripID, DateTime) |>
+  group_by(tripID) |>
+  mutate(lat_prev = lag(Latitude),
+         lon_prev = lag(Longitude),
+         dist = geosphere::distHaversine(matrix(c(lon_prev, lat_prev), ncol = 2),
+                matrix(c(Longitude, Latitude), ncol = 2)),
+         diffTime = as.numeric(difftime(DateTime, lag(DateTime, 1), units = "hours")), #regenerate diffTime
+         kph = ifelse(diffTime > 0 & !is.na(diffTime) & !is.na(dist), dist/1000/diffTime, 0), # use 0kph for first point (dTime and distance NA))
+         posFlag = factor(ifelse(kph > 110, "flagKPH", 
+                                 ifelse(kph > 50 & satellites <= 4 & satellites != 0, "flagKPHsat", "ok"))),
+         # When two flags occur in a row, only remove the first (spike cases)
+         filt = ifelse(posFlag != "ok" & lag(posFlag != "ok"), "keep", 
+                      ifelse(posFlag != "ok", "drop", "keep"))) |> 
+  ungroup() |>
+  filter(filt != "drop") |> 
+  droplevels()
+
+# Make sure the spdf of split trips correspond to the cleaned coordinates (post-removel of erratic positions)
+coords <- matrix(c(trips_keep@data$Longitude, trips_keep@data$Latitude),   ncol = 2)
+colnames(coords) <- c("dataGroup.Longitude", "dataGroup.Latitude")
+trips_keep@coords <- coords
+
+# Convert into a regular dataframe, for further manipulations
+data_tripSplit_df <- as.data.frame(trips_keep@data) 
+
+# Save to .rds (both the spdf and df)
+saveRDS(trips_keep, file = paste0(output_rdata, "/data_tripSplit_spdf.rds"))
+saveRDS(data_tripSplit_df, file = paste0(output_rdata, "/data_tripSplit_df.rds"))
+
+```
+
+```{r, eval = F, include = F}
+
+# Test plots to examine filtering success #
+
+if (dir.exists(here::here('output_data/clean_data/png/Speed filter check')) == FALSE) dir.create(here::here('output_data/clean_data/png/Speed filter check'))
+
+plotData <- trips_keep@data
+IDS <- sort(unique(plotData$ID))
+for (i in 1:length(IDS)) {
+  id <- subset(plotData, ID == IDS[i])
+   colonyID <- subset(colonies, colony == id$colony[1])
+   windows(width=10, height=5) #for Windows users
+   # Add colony position to id dataset so it's always within the x and y limits
+   id2 <- plyr::rbind.fill(id, colonyID)
+   # Now plot
+   plot(Latitude~Longitude, data = id2, col = "black", type = "l", asp = 1, main = IDS[i])
+   points(Latitude~Longitude, data = id2, col = as.factor(tripID), type = "p")
+   points(Latitude~Longitude, data = id2[which(id2$tripID == "-1"),], type = "p", col = "yellow")
+   points(Latitude~Longitude, data = colonyID, type = "p", col = "darkred")
+   maps::map("world", add=T)
+   savePlot(file=(paste0(output_png, "/Speed filter check/", IDS[i], '.png')), type = "png", device = dev.cur()) #for Windows users
+   dev.off()
+}
+
+```
+
+```{r, echo = F}
+
+head(data_tripSplit_df, 5) |>  
+  kbl(align = "l", digits = 2, caption = "Cleaned data split by individual trip at sea", booktabs = T) |>
+  kable_styling(full_width = F, position = "left", latex_options = "scale_down")
+
+```
+
+# Trip metrics
+
+This uses the function tripSummary from the package track2KBA. We run this function on cleaned tripSplits.
+
+Depart and Return datetimes and trip Duration are calculated based on the min and max datetime for each tripID, so these will include the points within the inner buffer that we reassigned earlier from -1 to the correct tripID.
+
+Note: the results of tripSummary are approximate. Some birds have positions back on colony in their trips and some do not (some positions within the inner buffer were not assigned to a specific tripID). This is fine for now, but could be improved for more detailed behavioural analysis in the future. If doing so, deciding what to consider a 'trip' versus just milling around near the colony will be important.
+
+## tripSummary function
+
+``` {r, include = T}
+
+data_tripSplit_spdf <- trips_keep
+remove(trips_keep)
+
+tripSummaryLHSP <- track2KBA::tripSummary(trips = data_tripSplit_spdf, colony = colonies, nests = T, extraDist = T)  
+# here extraDist = T so "the distance between the first and last points of each trip and the colony will be added to the 'total_dist' (total distance traveled) for each trip", so total_dist is a minimum total distance
+
+# Add some relevant variables
+tripSummaryLHSP <- tripSummaryLHSP |>  
+  mutate(duration2 = difftime(return, departure, units = "day"), # find duration of trip based on departure and return, so for incomplete trip this is minimum duration
+         day = ymd(paste(lubridate::year(departure), lubridate::month(departure), lubridate::day(departure), sep = "-")), # create variable day
+         year = year(day)) # have a simple variable "year" 
+
+# Add some relevant metadata
+tagMeta <- distinct(data_tripSplit_spdf@data, ID, tripID, tagProg, colony, sex, status, band, filename)
+
+tripSummaryLHSP <- left_join(tripSummaryLHSP, tagMeta, by = c("ID", "tripID")) # add the variable tagProg, sex and colony, for each trip
+
+```
+
+## Define type of trip
+
+Define trip_type: complete/classic, short (< 1.25 day or max distance <= 100 km), incomplete  (missing last or first section of trip),  or gappy (more than 30% of predicted relocations missing if trip not already classified as incomplete)
+
+Identify gappy trips first since it's possible for a trip to be incomplete AND have a gappy section in it. We don't want to send any gappy trips through the HMM model and we are going to be including the incompletes.
+
+``` {r, include = T}
+
+# A df with the distance from the colony of the first and last location of the trip
+colDistFirstLast <- data_tripSplit_df |> 
+  group_by(tripID) |> 
+  filter(row_number()==1 | row_number()==n()) |> dplyr::select(tripID, ColDist) |>
+  mutate(FirstLast = ifelse(row_number() == 1, "first", "last")) 
+
+colDistFirstLast <- reshape2::dcast(colDistFirstLast, tripID ~ FirstLast, value.var = "ColDist")
+
+#summary(colDistFirstLast) # Check that there are no 0s (at colony locations)
+
+tripSummaryLHSP0 <- left_join(tripSummaryLHSP, colDistFirstLast, by = "tripID")
+
+backup <- tripSummaryLHSP0
+
+# Assign the type of trip
+tripSummaryLHSP0 <- tripSummaryLHSP0 |>
+  mutate(trip_type = ifelse(tagProg == "3h" & (duration2 * 8) - (0.3*duration2*8) > n_locs | (duration2 * 12) - (0.3*duration2*12) > n_locs, "gappy trip", # based on number of loc expected if loc every 2 or 3 hours,
+                            ifelse(first >= 100000, "incomplete trip - start",
+                                ifelse(last >= 100000, "incomplete trip - end", # missing first or last part of trip (more than 100 km)
+                                       ifelse(duration2 <= 1.25 |  max_dist <= 100, "short", "complete")))),    # if a trip is shorter or equal to 1.25 day or max_dist <= 100 km and is not incomplete than it is considered short
+         trip_typeBasic = ifelse(trip_type %in% c("incomplete trip - start", "incomplete trip - end"), "incomplete trip", trip_type)) |>
+  # Remove old trip type column
+  dplyr::select(-complete)
+
+# Save trip metrics dataframe
+saveRDS(tripSummaryLHSP0, file = paste0(output_rdata, "/tripSummaryLHSP.rds"))
+write.csv(tripSummaryLHSP0, file = paste0(output_csv, "/tripSummaryLHSP.csv"), row.names = FALSE)
+                                              
+```
+
+```{r, echo = F}
+
+head(tripSummaryLHSP0, 5) |>  
+  kbl(align = "l", digits = 2, caption = "trip metrics_plus", booktabs = T) |>
+  kable_styling(full_width = F, position = "left",  latex_options = "scale_down")
+
+```
+
+## Add trip type to dataset
+
+```{r, include = T}
+
+tripType <- tripSummaryLHSP0 |> dplyr::distinct(tripID, trip_type, trip_typeBasic)
+
+data_tripSplit_df <- left_join(data_tripSplit_df, tripType,  by = c("tripID", "ID"))
+
+saveRDS(data_tripSplit_df, file = paste0(output_rdata, "/data_tripSplit_df.rds"))
+
+```
+
+## Add two more columns of interest, set factors
+
+```{r, include = T}
+
+## Create a column with simple incubation vs chick-rearing
+## Also a column for colony where the two sites at Baccalieu are treated as one
+## Make sure StartsOut and Returns columns don't have blanks
+
+data_tripSplit_df <- data_tripSplit_df |>
+  mutate(colonyBasic = ifelse(grepl("Baccalieu", colony), "Baccalieu", colony),
+         statusBasic = ifelse(status == "Transition - Inc", "incubation", 
+                              ifelse(status == "Transition - CR", "chick-rearing", 
+                                     ifelse(status == "Transition", NA, status))),
+         Year = as.factor(Year),
+         sexBasic = ifelse(sex %in% c("M", "F"), sex, "unk"),
+         sex = as.factor(sex),
+         sexBasic = as.factor(sexBasic),
+         colony = as.factor(colony),
+         colonyBasic = as.factor(colonyBasic),
+         status = as.factor(status),
+         statusBasic = as.factor(statusBasic)) |>
+  group_by(tripID) |>
+  mutate(StartsOut = ifelse("Yes" %in% unique(StartsOut), "Yes", NA),
+         Returns = ifelse("Yes" %in% unique(Returns), "Yes", 
+                          ifelse("No" %in% unique(Returns), "No", NA))) |>
+  ungroup()
+
+# Save final uninterpolated dataset
+saveRDS(data_tripSplit_df, file = paste0(output_rdata, "/data_tripSplit_df.rds"))
+
+```
+
+## Save visual of each finalized trip in a folder
+
+Here we run a function that saves a visual of each trip in a folder, just to help us see if the trips are properly split, to the best of what the dataset enable us to do. This is not run in the Rmarkdown. 
+
+Plots include a title and file name indicating if the track is complete, incomplete, short, or gappy (trip_type). A unique identifier is also included in the title and file name. A red circle indicates the colony location. Lines were added between points to simplify following the trajectory. 
+
+```{r, echo = F, eval = F}
+
+
+if (dir.exists(here::here('output_data/clean_data/png/trips')) == FALSE) dir.create(here::here('output_data/clean_data/png/trips'))
+
+IDS <- unique(data_tripSplit_df$tripID)
+
+for (i in 1:length(IDS)) {
+  id <- subset(data_tripSplit_df, tripID == IDS[i])
+  colonyID <- subset(colonies, colony == id$colony[1])
+  #quartz(width=10, height=5) #use for saving plot - Mac only
+  windows(width=10, height=5) #for Windows users
+  # Add colony position to id dataset so it's always within the x and y limits
+  id2 <- plyr::rbind.fill(id, colonyID)
+  # Now plot
+  plot(Latitude~Longitude, data = id2, type = "o", asp = 1, main = paste0(id2$status[1], ", ", IDS[i]))
+  points(Latitude~Longitude, data = colonyID, type = "p", col = "red")
+  maps::map("world", add=T)
+  #quartz.save(file=(paste0(id2[i],'.png')), type = "png", device = dev.cur(), dpi = 100)
+  savePlot(file=(paste0(output_png, "/trips/", id2$status[1], " - ", IDS[i], '.png')), type = "png", device = dev.cur()) #for Windows users
+  dev.off()
+}
+
+```
