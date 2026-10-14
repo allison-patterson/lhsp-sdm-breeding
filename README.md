@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/1417116838.svg)](https://doi.org/10.5281/zenodo.23376867)
 
 This repository archives the analyses included in the following paper:
 
