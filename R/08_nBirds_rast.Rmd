@@ -161,7 +161,8 @@ foreach (cn = unique(ph$colony)) %dopar% {
     of <- paste0(out_dir,'/', basename(f))
     if (file.exists(of) == FALSE) {
       r <- terra::rast(f)
-      q <- terra::quantile(r, 0.5, na.rm = T)
+      q <- terra::quantile(r, c(0.5, 0.05, 0.95))
+      names(q) <- c('median', 'lwr', 'upr')
       q <- q/terra::cellSize(q, unit = 'km')
       
       terra::writeRaster(q, paste0(out_dir,'/', basename(f)), 

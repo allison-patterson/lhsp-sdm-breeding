@@ -3,15 +3,15 @@ title: "Phenology for breeding SDM"
 author: "Katharine Studholme"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output: html_document
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
 ---
 
 ```{r setup, include=FALSE}
 
 require("knitr")
 knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
-
-renv::restore(lockfile = here::here('renv.lock'))
-
+source(here::here("R/functions.R"), echo = F)
 library(tidyr)
 library(dplyr)
 library(readxl)

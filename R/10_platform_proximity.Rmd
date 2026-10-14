@@ -11,8 +11,8 @@ knit: (function(inputFile, encoding) {
 
 require("knitr")
 knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
-
-renv::restore(lockfile = here::here('renv.lock'))
+# Load functions
+source(here::here("R/functions.R"), echo = F)
 
 library(sf)
 library(tidyverse)
