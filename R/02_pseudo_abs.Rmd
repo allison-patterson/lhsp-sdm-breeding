@@ -1,0 +1,317 @@
+---
+title: "Generate pseudo-absences" 
+subtitle: "" 
+author: "Allison Patterson"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+output: html_document
+---
+
+In this script we format colony and tracking data, define our study area, and get static predictor layers (e.g. bathymetry, colony distance). We then randomly define training:validation in our dataset at 80:20 within each colony and breeding status. Observed locations are resampled at a constant rate within colony and breeding stage. Pseudo absences are then sampled 1:1 within 150% max foraging distance of each source colony.
+
+```{r setup, include=FALSE}
+
+require("knitr")
+source(here::here("R/functions.R"), echo = F)
+knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
+
+```
+
+### Read and format data
+
+This analysis will focus on colonies in North America (Canada, US, and France) that contain at least `r min_pop` individuals. The formatted colony data are saved for later use.
+
+``` {r colony-data}
+
+# Load colonies data
+colonies <- openxlsx::read.xlsx(here::here('raw_data/LHSP Atlantic population survey data 10Sep2026.xlsx'))
+
+# Simplify colonies data
+colonies <- colonies |> 
+  # Simplify column names
+  dplyr::rename(population = `Estimated.no..of.mature.individuals`, country = Country, 
+                collon = Longitude, collat = Latitude) |> 
+  # Focus on North America
+  dplyr::filter(country %in% c('Canada','France','US'), population != 'Present') |> 
+  dplyr::mutate(
+    population = as.numeric(population),
+    region = ifelse(collat > 46, 'NL', 'SS') #Define regions
+  ) |> 
+  # Filter on population size
+  dplyr::filter(population > min_pop) |>
+  # Simplify colony names
+  tidyr::separate(Colony, into = c('colony'), sep = ' Island', extra = 'drop') |> 
+  dplyr::select(country, colony, collon, collat, population)
+
+# save formatted colony data
+saveRDS(colonies, paste0(envir,'/colonies.RDS'))
+
+```
+
+Next we read in a summary of foraging trips and the interpolated tracking data. The maximum foraging distance +50%, `r max_dist` km, is saved to define the study area for analysis in the next step. While birds travel different distances depending on their colony of origin, we reference the max value to reflect the intrinsic ability of the species. 
+
+``` {r get-maxdist}
+
+datSum <- readRDS(here::here('raw_data/tripSummaryLHSP.rds')) |>
+  dplyr::ungroup() |>
+  # Rrestrict analysis to complete trips
+  dplyr::filter(trip_typeBasic == "complete") |>
+  # Remove data from Scatarie, which only had a single deployment
+  dplyr::filter(colony != "Scatarie") |>
+  # Simplify status descriptions andlevels and make colony names consistent 
+  dplyr::mutate(statusBasic = ifelse(status %in% c("Transition - CR", "chick-rearing"), "chick-rearing",
+                                     ifelse(status %in% c("Transition - Inc", "incubation"), "incubation", NA)),
+                colonyBasic = ifelse(grepl("Baccalieu", colony), "Baccalieu", colony))
+
+# Calculate maximum distance (km) from colony * 1.5
+max_dist <- round(max(datSum$max_dist) * 1.5, -2)
+
+```
+
+Then we read in the location data which has been classified to 'foraging' and 'transiting' states. We join the location data with the colony data, this gives us some potential static predictor variables: colony longitude, colony latitude, and population.
+
+``` {r format-locs}
+
+# Read in HMM track data 
+dat <- readRDS(here::here('input_data/HMM_classified_data.rds')) |>
+  # Filter to trips that meet criteria for datSum
+  dplyr::filter(ID %in% datSum$tripID) |>
+  dplyr::select(ID, datetime, Longitude, Latitude, colonyBasic, 
+                statusBasic, states3_cov_te.i) |>
+  dplyr::rename(status = statusBasic, colony = colonyBasic, 
+                time = datetime, lon = Longitude, lat = Latitude) |>
+  dplyr::mutate(
+    state = states3_cov_te.i
+  ) |> 
+  dplyr::select(ID, time, lon, lat, colony, status, state)
+
+# Join with colony data
+dat <- dat |> 
+  dplyr::inner_join(colonies) |> 
+  dplyr::group_by(ID) |>
+  dplyr::mutate(
+    coldist = seabiRds::getColDist(lon, lat, collon[1], collat[1]), # calculate distance between location and source colony
+    dist = seabiRds::getDist(lon, lat) # calculate distance between consecutive points crossings
+  ) 
+
+# Calculate maximum step length (km)
+max_step <- round(max(dat$dist, na.rm = T), -1)
+
+# Convert to spatial object
+dat <- sf::st_as_sf(dat, coords = c('lon','lat'), crs = 4326)
+
+saveRDS(dat, here::here('input_data/data_tracks_simplified.rds'))
+
+```
+
+Calculate the proportion of locations that fall inside and outside of Canada's EEZ.
+
+```{r}
+
+eez <- sf::st_read(here::here('raw_data/EEZ_Canada/200_mile.shp')) |> 
+  sf::st_transform(crs = 4326)
+
+mapview::mapview(eez) + mapview::mapview(dat)
+dat$eez <- sf::st_intersects(dat, eez, sparse = F)[,1]
+
+mapview::mapview(dat, zcol = 'eez')
+dat |> 
+  dplyr::ungroup() |> 
+  dplyr::summarise(
+    in_eez = sum(eez)/dplyr::n(),
+    out_eez = sum(eez == FALSE)/dplyr::n(),
+    )
+
+```
+
+### Define study area
+
+We define a study area using a bounding box of at least `r max_dist` km around all the colonies included in the analysis. This is implemented as a buffer of `r max_dist` km on a bounding box of colony locations. 
+
+```{r spat-extent}
+
+col_sf <- sf::st_as_sf(colonies, coords = c('collon','collat'), crs = 4326)
+
+reg <- sf::st_as_sfc(sf::st_bbox(col_sf))
+reg <- sf::st_buffer(reg, dist = max_dist * 1000)
+reg <- sf::st_as_sfc(sf::st_bbox(reg))
+reg <- sf::st_as_sf(reg)
+
+mapview::mapview(reg, col.regions = 'red') + mapview::mapview(col_sf) 
+
+```
+
+### Download bathymetry and derive static layers
+
+We downloaded bathymetry layer GEBCO_2020 with erddap, using a subset of every 10th grid cell to reduce the file size. We used the bathymetry layer to calculate slope, distance from coast, and distance from shelf break (at the 200 m isobath).
+
+This relies on functions in a custom package that can be installed with:
+devtools::install_github("allison-patterson/PelagicMagic")
+
+```{r get-static}
+
+PelagicMagic::get_bathymetry(out_dir = envir, region = unlist(sf::st_bbox(reg))[c(1,3,2,4)], 
+                             stride = 12, dist_unit = 'km')
+
+r <- terra::rast(paste0(envir, '/bathymetry.nc'))
+r <- terra::ifel(r > 0, 0, r)
+terra::plot(r, main = 'Bathymetry (m)')
+
+r <- terra::rast(paste0(envir, '/slope.nc'))
+terra::plot(r, main = 'Seafloor slope (deg)')
+
+r <- terra::rast(paste0(envir, '/coastdist.nc'))
+terra::plot(r, main = 'Distance to coastline (km)')
+
+r <- terra::rast(paste0(envir, '/shelfdist.nc'))
+terra::plot(r, main = 'Distance to shelf break (km)')
+
+```
+
+## Calculate layers for distance from colony
+
+Create a raster with over water distance from colony for each colony using custom function.
+
+``` {r colonydist}
+
+colonies <- sf::st_as_sf(colonies, coords = c('collon','collat'), crs = 4326)
+mapview::mapview(colonies, zcol = 'population')
+
+r <- terra::rast(paste0(envir,'/bathymetry.nc'))
+r <- terra::ifel(r > 0, NA, 1)
+names(r) <- 'lsmask'
+ 
+cc <- data.frame(location = colonies$colony,
+                 sf::st_coordinates(colonies))
+names(cc) <- c('location','x','y')
+
+# Use PelagicMagic to create colonydist layers
+PelagicMagic::get_colonydist(coords = cc, 
+                     landmask = r, 
+                     out_dir = paste0(envir,'/colonydist'),
+                     dist_unit = 'km',
+                     plot = T
+                     )
+
+```
+
+### Generate pseudo-absences
+
+First, we assign 80% of tracks to be used as training data in model development and 20% of data was withheld as validation data. Data were grouped by colony and breeding status before being assigned to training or validation sets.
+
+```{r sample-data}
+
+dat |> 
+  sf::st_drop_geometry() |> 
+  dplyr::mutate(year = strftime(time, '%Y')) |> 
+  dplyr::group_by(colony, status, ID) |> 
+  dplyr::summarise(
+    nlocs = dplyr::n(),
+    .groups = 'drop'
+  ) |> 
+  dplyr::filter(!is.na(status)) |> 
+  dplyr::group_by(colony, status) |> 
+  dplyr::summarise(
+    nbirdyrs = length(unique(substr(ID, 1, nchar(ID)-3))),
+    ntrips = dplyr::n(),
+    nlocs = sum(nlocs),
+    .groups = 'drop'
+  ) |> 
+  flextable::flextable() |> 
+  flextable::set_caption('Sample size by colony and breeding status') |> 
+  flextable::width(j = 2, width = 1.5) |> 
+  flextable::font(fontname = 'times', part = 'all')
+
+# ensures the same sample result every time
+set.seed(12837)
+
+idx <- dat |> 
+  sf::st_drop_geometry() |> 
+  dplyr::mutate(year = strftime(time, '%Y')) |> 
+  dplyr::group_by(colony, status, ID) |> 
+  dplyr::summarize(.groups = 'drop')  |> 
+  dplyr::group_by(colony, status) |> 
+  dplyr::slice_sample(prop = 0.2) |> 
+  dplyr::pull(ID)
+
+dat$group <- ifelse(dat$ID %in% idx, 'Validation','Train')
+  
+```
+
+In order to ensure that we adequately sample the available habitat around each colony, we sampled 10,000 observations with replacement for each combination of colony and breeding status in the training data and 2,500 samples for the validation data. With a tree-based machine learning algorithm it is important that we maintain a balanced ratio of observations and pseudo-absences (PAs). By re-sampling the observations with replacement before generating PAs we can more fully sample the available environment while maintaining this ratio.
+
+```{r}
+
+set.seed(789)
+train <- dat |> 
+  dplyr::filter(group == 'Train') |> 
+  dplyr::group_by(colony, status) |> 
+  dplyr::sample_n(10000, replace = T)
+
+validation <- dat |> 
+  dplyr::filter(group == 'Validation') |> 
+  dplyr::group_by(colony, status) |> 
+  dplyr::sample_n(2500, replace = T)
+
+tt <- rbind(train, validation)
+
+```
+
+We generated pseudo-absence points within a `r 5*max_step` km buffer distance of all observed locations from each colony. The buffer distance is 5x the maximum step length (`r max_step` km) observed in the data. 
+
+```{r get-pa}
+
+r <- terra::rast(paste0(envir,'/colonydist/Baccalieu.nc'))
+r <- terra::ifel(is.na(r), NA, 1)
+terra::plot(r)
+
+out <- get_buffer_pa(data = tt,
+                     landmask = r, # raster with water = 1, land = NA
+                     nsamp = 1, # number of pseudo-absences per point
+                     max_dist = max_step * 5, # maximum distance from observed point (km)
+                     dist_weight = F # do not weight locations by distance from colony
+)
+
+```
+
+Plot showing the observed and pseudo-absence locations for each colony.
+
+```{r map-1}
+
+out <- out |> dplyr::ungroup()
+
+bb <- seabiRds::bbox_at_zoom(out)
+
+pal <- viridis::viridis(n = 2)
+
+p <- ggplot() +
+  geom_sf(data = coast) +
+  # geom_sf(data = out,aes(col = factor(obs)), alpha = 0.01) +
+    # scale_colour_viridis_d(direction = -1, limits = factor(c(0, 1), levels = c(0,1))) +
+  geom_sf(data = out[out$obs == 0,],col = pal[2], alpha = 0.01) +
+  geom_sf(data = out[out$obs == 1,],col = pal[1], alpha = 0.01) +
+  scale_color_manual(values = c(`0`=pal[2],`1`=pal[1])) +
+  facet_wrap(.~colony, nrow = 2) +
+  scale_y_continuous(breaks = seq(0, 80, 10)) +
+  scale_x_continuous(breaks = seq(-80, 80, 20)) +
+  coord_sf(xlim = bb[c(1, 3)], ylim = bb[c(2,4)]) +
+  labs(x = '', y= '', color = 'Type') +
+  theme(
+    text = element_text(size = 8),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black')
+  )
+print(p)
+  
+```
+
+## Save data
+
+Save sampled observation and pseudo-absence locations.
+
+```{r save-data}
+
+saveRDS(out, here::here('input_data/LHSP_locs_plus_PA.RDS'))
+
+```

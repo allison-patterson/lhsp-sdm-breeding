@@ -1,0 +1,1153 @@
+---
+title: "manuscript figures"
+author: "Allison Patterson, Katharine Studholme"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+---
+
+This script generates figures used in the manuscript.
+
+```{r setup, include=FALSE}
+
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
+
+# Load functions
+source(here::here("R/functions.R"), echo = F)
+ogl <- readRDS(here::here('raw_data/threats/OGL_polygons.rds'))
+
+colgrid <- readRDS(paste0(envir,'/colonies.RDS'))
+
+# plot details
+textSize <- 11
+plotWid <- 6.5
+plotHei <- 5
+
+```
+
+### Create base map
+
+This creates a base map and some shapefiles that are used repeatedly in plotting.
+
+```{r, include=FALSE}
+
+# Used for spatial extent
+dat <- readRDS(here::here('input_data/LHSP_locs_plus_PA.RDS')) |>
+  dplyr::ungroup() |> sf::st_transform(crs = mp)
+
+# Relies on function in custom package available at https://github.com/allisonglider/seabiRds
+bb <- seabiRds::bbox_at_zoom(dat)
+
+coast_mp <- coast |> sf::st_transform(crs = mp)
+
+eez <- sf::st_read(paste0(envir,'/EEZ_Canada/200_mile.shp')) |> sf::st_transform(crs = mp)
+
+# Create a base map with bathymetry
+b <- terra::rast(paste0(envir,'/bathymetry.nc'))
+b <- terra::project(b, mp)
+bath_base <- ggplot() +
+  tidyterra::geom_spatraster_contour_filled(data = b, 
+                                            breaks = c(seq(-10000,-1000,1000), seq(-750,0,250))) +
+  scale_fill_grey(start = 0.2, end = 1, guide = F) +
+  ggnewscale::new_scale_fill() +
+  geom_sf(data=coast_mp)
+saveRDS(bath_base, paste0(envir,'/bath_base_map.RDS'))
+
+bcont <- sf::st_as_sf(terra::as.polygons(terra::ifel(b > -300, 1, 0)))
+
+## petroleum parcels
+oog <- readRDS(here::here("raw_data/threats/threats_offshorePetro_licensePolygons.rds")) |> sf::st_transform(crs = mp)
+
+## petroleum platforms
+oogPts <- read.csv(here::here("raw_data/threats/threats_offshorePetro_productionInstallationPts.csv")) |> 
+  sf::st_as_sf(coords = c('lon','lat'), crs = 4326) |> 
+  sf::st_transform(crs = mp)
+
+```
+
+### Figure 1: Study area
+
+Format population data
+
+```{r}
+
+## colony data
+pop <- readxl::read_excel(here::here("raw_data/LHSP Atlantic population survey data 10Sep2026.xlsx")) |>
+  dplyr::mutate(popEst = as.numeric(`Estimated no. of mature individuals`)) |>
+  dplyr::filter(popEst >= min_pop) |>
+  dplyr::filter(Country %in% c("Canada", "France", "US")) |>
+  dplyr::mutate(Colony = gsub(" Island", "", Colony),
+                Colony = gsub(" \\(Witless Bay\\)", "", Colony),
+                Colony = gsub(" \\(Fortune Bay\\)", "", Colony),
+                Colony = gsub(" \\(Grand Manan Archipelago\\)", "", Colony),
+                Colony = gsub(", Whites", "", Colony),
+                Colony = gsub(", South", "", Colony),
+                trackStat = factor(ifelse(Colony %in% c("Baccalieu", "Gull", "Middle Lawn", "Country", "Bon Portage", "Kent"), "yes", "no"), ordered = T, levels = c("yes", "no"))) |>
+  dplyr::select(Colony, Longitude, Latitude, popEst, trackStat) |>
+  sf::st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) |>
+  sf::st_transform(sf::st_crs(mp))
+
+```
+
+Inset for Nova Scotia lease areas.
+
+```{r}
+
+my_pal <- c('#E69F00','#56B4E9','#009E73','#CC79A7')
+names(my_pal) <- sort(unique(oog$Activity), decreasing = F)
+
+ns_ogl <- ogl |> dplyr::filter(Province == 'NS')
+bb_ns <- seabiRds::bbox_at_zoom(ns_ogl, zoom_level = 8)
+box_ns <- sf::st_as_sfc(bb_ns, crs = mp)
+
+lab_1 <- ns_ogl |> dplyr::filter(ProdArea == 'Panuke')
+lab_2 <- ns_ogl |> dplyr::filter(ProdArea == 'Alma')
+lab_3 <- ns_ogl |> dplyr::filter(ProdArea == 'South Venture')
+sable <- coast_mp |> 
+  sf::st_transform(sf::st_crs(ogl)) |> 
+  sf::st_crop(box_ns) |> 
+  dplyr::mutate(label = 'Sable Island') |> 
+  sf::st_centroid() 
+sc <- sf::st_coordinates(sable) |> data.frame()
+
+ns <- bath_base +
+  geom_sf(data=ogl, aes(fill = license_type), alpha = 0.8) +
+  scale_fill_manual(values = my_pal) +
+  coord_sf(xlim = bb_ns[c(1,3)], bb_ns[c(2,4)], label_axes = '--EN') +
+  ggsflabel::geom_sf_text_repel(data=lab_1, aes(label = ProdArea), 
+                                nudge_x = -15000, nudge_y = 15000, seed = 10, size = 2.25, bg = 'transparent') +
+  ggsflabel::geom_sf_text_repel(data=lab_2, aes(label = ProdArea), 
+                                nudge_x = -15000, nudge_y = -15000, seed = 10, size = 2.25, bg = 'transparent') +
+  ggsflabel::geom_sf_text_repel(data=lab_3, aes(label = ProdArea), 
+                                nudge_x = 10000, nudge_y = 15000, seed = 10, size = 2.25, bg = 'transparent') +
+  annotate('text', x = sc$X, y = sc$Y -8000, label = sable$label, angle = 10, size = 2.25, fontface = "italic") +
+  guides(fill = 'none') +
+  labs(x = '', y  = '') +
+  ggspatial::annotation_scale(location = "tr", width_hint = 0.5, style = 'ticks', 
+                              text_cex = 0.4, height = unit(0.15, "cm")) +
+  theme(
+    text = element_text(size = 9),
+    plot.title = element_text(hjust = 0.5),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, 'mm'),
+    legend.key.height = unit(4, 'mm'), 
+    legend.key.spacing = unit(0, 'mm'),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black'),
+    panel.border = element_rect(colour = 'black')
+  )
+ns
+
+```
+
+Inset for western Newfoundland lease areas.
+
+```{r}
+
+nl_ogl <- ogl |> dplyr::filter(Province == 'NL', ProdArea != 'WNL_1070')
+bb_nl <- seabiRds::bbox_at_zoom(nl_ogl, zoom_level = 6.25)
+bb_nl[2] <- bb_nl[2]-0
+box_nl <- sf::st_as_sfc(bb_nl, crs = mp)
+
+lab_1 <- nl_ogl |> dplyr::filter(ProdArea %in% c('EN_1169', 'EN_1172', 'Sea Rose'))
+lab_2 <- nl_ogl |> dplyr::filter(ProdArea %in% c('EN_1170','EN_1171', 'Hibernia'))
+lab_3 <- nl_ogl |> dplyr::filter(ProdArea %in% c('EN_1173','Terra Nova'))
+lab_4 <- nl_ogl |> dplyr::filter(ProdArea %in% c('Hebron','EN_1166'))
+
+nl <- bath_base +
+  geom_sf(data=ogl, aes(fill = license_type), alpha = 0.8) +
+  scale_fill_manual(values = my_pal) +
+  coord_sf(xlim = bb_nl[c(1,3)], bb_nl[c(2,4)], label_axes = '--EN') +
+  guides(fill = 'none') +
+  labs(x = '', y  = '', fill = 'Production Area') +
+  ggsflabel::geom_sf_text_repel(data=lab_1, aes(label = ProdArea), 
+                                nudge_x = 100000, nudge_y = 30000, seed = 10, size = 2.25, bg = 'transparent') +
+  ggsflabel::geom_sf_text_repel(data=lab_2, aes(label = ProdArea), 
+                                nudge_x = -80000, nudge_y = 40000, seed = 10, size = 2.25, bg = 'transparent') +
+  ggsflabel::geom_sf_text_repel(data=lab_3, aes(label = ProdArea), 
+                                nudge_x = -25000, nudge_y = -50000, seed = 10, size = 2.25, bg = 'transparent') +
+  ggsflabel::geom_sf_text_repel(data=lab_4, aes(label = ProdArea), 
+                                nudge_x = 100000, nudge_y = 0, seed = 10, size = 2.25, bg = 'transparent') +
+  ggspatial::annotation_scale(location = "tr", width_hint = 0.6, style = 'ticks', text_cex = 0.4, height = unit(0.15, "cm")) +
+  theme(
+    text = element_text(size = 9),
+    plot.title = element_text(hjust = 0.5),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, 'mm'),
+    legend.key.height = unit(4, 'mm'), 
+    legend.key.spacing = unit(0, 'mm'),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black'),
+    panel.border = element_rect(colour = 'black')
+  )
+nl
+
+```
+
+Create overview map.
+
+```{r}
+
+colonies <- sf::st_as_sf(colgrid, coords = c('collon', 'collat'), crs = 4326, remove = FALSE) |> 
+  sf::st_transform(crs = mp)
+
+oog <- sf::st_transform(oog, sf::st_crs(ogl))
+bb_oog <- seabiRds::bbox_at_zoom(oog)
+bb_col <- seabiRds::bbox_at_zoom(colonies)
+bb <- c(bb_col$xmin, bb_col$ymin, bb_oog$xmax, bb_oog$ymax)
+
+b <- terra::rast(paste0(envir,'/bathymetry.nc'))
+b <- terra::project(b, mp)
+
+```
+
+
+```{r}
+
+lab_1070 <- ogl |> dplyr::filter(ProdArea == 'WNL_1070')
+
+ob <- ogl |> dplyr::filter(ProdArea == 'EN_1170') |> sf::st_centroid() |> sf::st_coordinates(ob) |> data.frame()
+
+ml <- data.frame(
+  X = c(-550000, -260000, 650000, 1150000, 850000, 850000, 1000000,-275000,-350000,300000), 
+  Y = c(-230000, -100000, -75000, 360000, 260000, 550000, 450000,-90000,40000,450000), 
+  name = c('Gulf of\nMaine', 'Scotian Shelf','Grand\nBank', 'Flemish\nCap',
+           'Jeanne d\`Arc\nBasin','Orphan\nBasin', 'Flemish\nPass', 'Nova\nScotia', 'New\nBrunswick', 'Newfoundland'),
+  angle = c(0,20,0,0,0,0,0,0,0,0),
+  nx = c(0,0,0,0,-130000,-20000,250000,0,0,0),
+  ny = c(0,0,0,0,100000,200000,100000,0,0,0)) |> 
+  sf::st_as_sf(coords = c('X','Y'), crs = sf::st_crs(oog))
+
+bl <- data.frame(
+  X = c(bb_nl[1] + 20000, bb_ns[1] + 20000), 
+  Y = c(bb_nl[4] - 20000, bb_ns[4] - 20000), 
+  name = c('B', "C"),
+  angle = c(0,0))
+
+pop <- pop |> 
+  cbind(sf::st_coordinates(pop)) |> 
+  dplyr::arrange(desc(Y)) |> 
+  dplyr::mutate(
+    collab = 1:dplyr::n(),
+    collab = dplyr::case_when(Colony == 'Bon Portage' ~ 13,
+                              Colony == 'Kent' ~ 14,
+                              Colony == 'Little Duck' ~ 15,
+                              Colony == 'Great Duck' ~ 16,
+                              TRUE ~ collab),
+    nx = 00000,
+    ny = 50000)
+
+m <- bath_base +
+  #geom_sf(data=ogl, aes(fill = ProdArea), col = 'transparent') +
+  geom_sf(data = oog, aes(fill = Activity), linewidth = 0.01, alpha = 0.8) +
+  scale_fill_manual(values = my_pal) +
+  geom_sf(data=box_ns, fill = 'transparent', col = 'black') +
+  geom_sf(data=box_nl, fill = 'transparent', col = 'black') +
+  #scale_fill_manual(values=my_pal, guide = guide_legend(reverse = TRUE)) +
+  # geom_sf(data=colonies)+
+  geom_sf(data = pop, aes(size = popEst, color = trackStat), pch = 1, stroke = 0.5) +
+  scale_size(breaks = c(15000, 100000, 500000, 3000000), 
+             range = c(0.7, 5), name = "Colony Size", label = scales::comma, guide = "none") +
+  scale_color_manual(values = c("red", "black"), guide = "none") +
+  guides(alpha = 'none') +
+  coord_sf(xlim = bb[c(1,3)], bb[c(2,4)]) +
+  labs(x = '', y = '', fill ='') +
+  ggsflabel::geom_sf_text_repel(data=lab_1070, aes(label = ProdArea), 
+                                nudge_x = -150000, nudge_y = -50000, seed = 10, size = 2.25, bg = 'transparent') +
+  ggsflabel::geom_sf_text_repel(data = ml, aes(label = name, angle = angle), nudge_x = ml$nx, nudge_y = ml$ny, 
+                                size = 2.25, seed = 2, fontface = "italic", bg = 'transparent') +
+  ggsflabel::geom_sf_text_repel(data = pop, aes(label = collab, color = trackStat), nudge_x = pop$nx, nudge_y = pop$ny,
+                                size = 2.25, seed = 10, fontface = "bold") +
+  # annotate('text', label = ml$name, x = ml$X, y = ml$Y, size = 1.75, fontface = "italic", angle = ml$angle,
+  #          nudge_x = ml$nx, nudge_y = ml$ny) +
+  annotate('text', label = bl$name, x = bl$X, y = bl$Y, size = 2.25, fontface = "bold", angle = bl$angle) +
+  theme(
+    text = element_text(size = 9),
+    axis.text.y = element_text(angle = 90, hjust = 1),
+    plot.title = element_text(hjust = 0.5),
+    legend.position = 'inside',
+    legend.position.inside = c(0.99, 0.99),
+    legend.justification = c(1,1),
+    legend.title = element_blank(),
+    legend.background = element_blank(),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, 'mm'),
+    strip.background = element_rect(fill = 'transparent'),
+    legend.key.height = unit(4, 'mm'), 
+    legend.key.spacing = unit(1, 'mm'),
+    strip.text = element_text(colour = 'black')
+  )
+#m
+
+```
+
+Save combined map
+
+```{r}
+
+p <- cowplot::plot_grid(nl, 
+                        ns,
+                        nrow = 2, 
+                        labels = c('B','C')
+)
+pp <- cowplot::plot_grid(m, p, nrow = 1, rel_widths = c(0.72,0.28), labels = c('A',NA))
+
+# ggsave(here::here('plots_man/Fig_1_revised.png'),pp,
+#        units = 'in', width = 7, height = 5, bg = 'white')
+
+```
+
+### Figure 2: SDM workflow
+
+Flowchart made in powerpoint
+
+### Figure 3: GPS tracks
+
+Map GPS tracks by breeding stage.
+
+```{r map-allTracks}
+
+dat <- readRDS(here::here('input_data/data_tracks_simplified.rds')) |> 
+  sf::st_transform(crs = mp)
+
+# Tracking data
+tracks <- dat |>
+  dplyr::group_by(ID) |>
+  dplyr::summarize(do_union=FALSE) |>
+  sf::st_cast("LINESTRING") 
+
+# Return covariates to dataset
+covs <- dat |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(ID) |>
+  dplyr::summarize(colony = colony[1], 
+                   status = status[1]) |>
+  dplyr::mutate(colony = factor(colony, ordered = T, levels = c("Baccalieu", "Gull", "Middle Lawn", "Country", "Bon Portage", "Kent")),
+                status = ifelse(status == "incubation", "Incubation", "Chick-rearing"),
+                status = factor(status, ordered = T, levels = c("Incubation", "Chick-rearing"))) 
+
+tracks <- dplyr::left_join(tracks, covs, by = "ID") 
+
+# project colonies
+trackCols <- colgrid |>
+  dplyr::filter(colony %in% c("Baccalieu", "Gull", "Middle Lawn", "Country", "Bon Portage", "Kent")) |>
+  sf::st_as_sf(coords = c("collon", "collat"), crs = 4326) |>
+  sf::st_transform(crs = mp)
+
+# offshore facilities oogPts already projected
+
+## Get plot extent based off tracking data, plus some wiggle room
+bb <- sf::st_bbox(tracks)
+bb[1] <- bb[1] - 100000
+bb[2] <- bb[2] - 100000
+bb[3] <- bb[3] + 100000
+bb[4] <- bb[4] + 100000
+
+# Facet by breeding stage, color by colony
+p <- bath_base +
+  facet_wrap(~status) +
+  geom_sf(data = tracks, aes(color = colony), linewidth = 0.2) +
+  geom_sf(data = eez, fill = 'transparent', col = "white", linetype = 2, linewidth = 0.4) +
+  geom_sf(data = oogPts, pch = 20, size = 1, color = "red") +
+  geom_sf(data = trackCols, pch = 21, fill = "white", size = 1.5) +
+  coord_sf(xlim = c(bb[1], bb[3]), ylim = c(bb[2], bb[4])) +
+  labs(x = '', y= '', color = '') +
+  guides(color=guide_legend(nrow = 1, reverse = T, override.aes = list(linewidth = 1))) +
+  ggspatial::annotation_scale(location = "br", height = unit(0.15, "cm"), text_col = "white", text_cex = 0.5, line_width = 0.5) +
+  theme(
+    text = element_text(size = textSize),
+    legend.position = 'bottom',
+    legend.margin= ggplot2::margin(0, 0, 0, 0, 'mm'),
+    plot.margin = ggplot2::margin(0, 0, 0, 0, 'mm'),
+    strip.background = element_blank(),
+    strip.text = element_text(colour = 'black')
+  )
+
+print(p)
+
+#ggsave(here::here('plots_man/AllTracks_byStage.png'), p, units = 'in', width = plotWid, height = plotHei*0.75)
+
+```
+
+
+### Figure 4: Variable inclusion
+
+```{r}
+
+imp <- readRDS(here::here('output_data/bart_model_full_imp.RDS'))
+
+tt <- data.frame(
+  var = names(imp$avg_var_props),
+  imp = imp$avg_var_props,
+  sd = imp$sd_var_props
+) |> 
+  dplyr::mutate(
+    var = dplyr::case_when(var %in% c('daynight_day','daynight_night') ~ 'daynight',
+                           var %in% c('region_SS','region_NL') ~ 'region',
+                           var %in% c('state_Foraging','state_Transit') ~ 'state',
+                           var %in% c('status_chick-rearing','status_incubation') ~ 'status',
+                           TRUE ~var
+    )) |> 
+  dplyr::group_by(var) |> 
+  dplyr::summarise(
+    imp = sum(imp),
+    sd = sum(sd)
+  ) |> 
+  dplyr::ungroup()
+
+tt$var <- factor(tt$var, tt$var[order(tt$imp, decreasing = TRUE)])
+
+tt <- tt |> 
+  dplyr::arrange(desc(imp)) |> 
+  dplyr::mutate(
+    type = dplyr::case_when(var %in% c('logpop','collat',          
+                                       'collon','collat', 
+                                       'region') ~ 'Colony-specific',
+                            var %in% c('colonydist','coastdist','competition','logpop','collat',          
+                                       'shelfdist','elevation','collon','collat', 'slope') ~ 'Static',
+                            var %in% c('so','thetao', 'chl','nppv','mnkc_hmlmeso','zooc','mnkc_epi', 
+                                       'ssha','mnkc_mumeso','sstsd','sshsd', 
+                                       'mlotst','currsd','current') ~ 'Dynamic',
+                            var %in% c('status',
+                                       'state',
+                                       'daynight') ~ 'Conditional'),
+    varname = dplyr::case_when(
+      var == 'colonydist' ~ "Distance from colony",
+      var == 'coastdist' ~ "Distance from coast",
+      var == 'competition' ~ "Competition",
+      var == 'logpop' ~ "Colony size",
+      var == 'shelfdist' ~ "Distance from shelf",
+      var == 'elevation' ~ "Bathymetry",
+      var == 'collat' ~ "Colony latitude",
+      var == 'collon' ~ "Colony longitude",
+      var == 'region' ~ "Region",
+      var == 'so' ~ "Salinity",
+      var == 'slope' ~ "Slope",
+      var == 'thetao' ~ "SST",
+      var == 'chl' ~ "Chlorophyll a",
+      var == 'nppv' ~ "NPP",
+      var == 'mnkc_hmlmeso' ~ "HML micronekton",
+      var == 'zooc' ~ "Zooplankton",
+      var == 'mnkc_epi' ~ "Epipelagic micronekton",
+      var == 'ssha' ~ "SSHa",
+      var == 'mnkc_mumeso' ~ "MU mesopelagic micronekton",
+      var == 'sstsd' ~ "SST gradient",
+      var == 'sshsd' ~ "SSH gradient",
+      var == 'mlotst' ~ "MLD",
+      var == 'currsd' ~ "Current gradient",
+      var == 'current' ~ "Current speed",
+      var == 'status' ~ "Breeding status",
+      var == 'state' ~ "Behaviour state",
+      var == 'daynight' ~ "Time of day",
+    ),
+    cumsum = cumsum(imp),
+    type = factor(type, levels = c('Colony-specific','Static','Dynamic','Conditional'))
+  )
+
+tt$varname <- factor(tt$varname, tt$varname[order(tt$imp)])
+
+tt |> 
+  dplyr::group_by(type) |> 
+  dplyr::summarise(
+    median = median(imp),
+    sum = sum(imp)
+  )
+
+RColorBrewer::brewer.pal(n = 4, name = 'Dark2')
+
+p <- ggplot() +
+  geom_bar(data = tt, aes(y = varname, x = imp, fill = type), stat = 'identity') +
+  geom_errorbarh(data = tt, aes(y = varname, xmin = imp - sd, xmax = imp + sd), height = 0) +
+  scale_fill_brewer(palette = 'Dark2') +
+  labs(y = 'Predictor', x = 'Variable inclusion rate', fill = '') +
+  theme(
+    text = element_text(size = textSize),
+    legend.position = c(0.99, 0.01),
+    legend.justification = c(1, 0),
+    legend.background = element_blank(),
+  )
+p
+# ggsave(here::here('plots_man/variable_inclusion_rate.png'), p, units = 'in', width = 6.5, height = 5)
+
+```
+
+
+### Figure 5: SDM density predictions
+
+Combine density for each month over all colonies.
+
+```{r}
+
+od <- here::here('plots_man/density_summaries')
+
+mon_dens <- terra::rast()
+mon_ci <- terra::rast()
+nn <- c()
+for (d in c('daily')) {
+  for (mon in month.abb[6:9]) {
+    fn <- list.files(od, pattern = mon, full.names = T)
+    fn <- fn[grep(d, fn)]
+    r <- terra::rast(fn)
+    mon_dens <- c(mon_dens, r[[1]])
+    mon_ci <- c(mon_ci, r[[3]] - r[[2]])
+    nn <- c(nn, paste(month.name[month.abb == mon]))
+  }
+}
+
+names(mon_dens) <- nn
+names(mon_ci) <- nn
+
+nval <- signif(colSums(terra::values(mon_dens) * terra::values(terra::cellSize(mon_dens, unit = 'km'), ID = F)[,1], na.rm = T), 3)
+names(mon_dens) <- paste0(names(mon_dens), ' \n(n=', formatC(nval, big.mark=",", format = 'd'),')' )
+names(mon_ci) <- paste0(names(mon_ci), ' \n' )
+
+```
+
+Plot median density over all colonies by month.
+
+```{r}
+
+colonies <- sf::st_as_sf(colgrid, coords = c('collon', 'collat'), crs = 4326, remove = FALSE) |> 
+  sf::st_transform(crs = mp) 
+
+bb <- seabiRds::bbox_at_zoom(dat, zoom_level = 3.8)
+bg <- viridis::turbo(n = 1, begin = 0, end = 0, alpha = 0.9)
+options(scipen = 1000)
+
+u2 <- expression('Density\nbirds/km'^2)
+
+p <- ggplot() +
+  tidyterra::geom_spatraster(data = mon_dens) +
+  scale_fill_viridis_c(option = 'H', na.value = bg, alpha = 0.9) +
+  #geom_sf(data = eez, fill = 'transparent', linetype = 1, linewidth = 0.4, col = grey(.6)) +
+  geom_sf(data = bcont, fill = 'transparent', linetype = 1, linewidth = 0.2, col = 'white') +
+  geom_sf(data = coast_mp, fill = grey(0.9), linewidth = 0.1) +
+  geom_sf(data = colonies, aes(size = population), shape = 1, col = 'yellow') +
+  facet_wrap(~lyr, nrow = 1) +
+  scale_size_continuous(range = c(0.7, 5)) +
+  scale_y_continuous(breaks = seq(-90, 90, 10)) +
+  scale_x_continuous(breaks = seq(-120, 90, 10)) +
+  coord_sf(xlim = bb[c(1, 3)], ylim = bb[c(2,4)]) +
+  guides(size = 'none') +
+  labs(x = '', y= '', fill = u2) +
+  theme(
+    text = element_text(size = textSize-2),
+    legend.title = element_text(size = textSize-2),
+    legend.text = element_text(size = 8),
+    axis.text = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, 'mm'),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black')
+  )
+p
+# ggsave(here::here('plots_man/monthly_dens_gps.png'), p, units = 'in', width = 9, height = 2.5)
+
+```
+
+Overall 90% credible interval for density by month.
+
+```{r}
+
+bg <- viridis::rocket(n = 1, begin = 0, end = 0, alpha = 0.9)
+
+u2 <- expression('90% CI\nbirds/km'^2)
+
+q <- ggplot() +
+  tidyterra::geom_spatraster(data = mon_ci) +
+  scale_fill_viridis_c(option = 'rocket', na.value = bg, alpha = 0.9) +
+  #geom_sf(data = eez, fill = 'transparent', linetype = 1, linewidth = 0.4, col = grey(.6)) +
+  geom_sf(data = bcont, fill = 'transparent', linetype = 1, linewidth = 0.2, col = 'white') +
+  geom_sf(data = coast_mp, fill = grey(0.9), linewidth = 0.1) +
+  geom_sf(data = colonies, aes(size = population), shape = 1, col = 'yellow') +
+  facet_wrap(~lyr, nrow = 1) +
+  scale_size_continuous(range = c(0.7, 5)) +
+  scale_y_continuous(breaks = seq(-90, 90, 10)) +
+  scale_x_continuous(breaks = seq(-120, 90, 10)) +
+  coord_sf(xlim = bb[c(1, 3)], ylim = bb[c(2,4)]) +
+  guides(size = 'none') +
+  labs(x = '', y= '', fill = u2) +
+  theme(
+    text = element_text(size = textSize-2),
+    legend.title = element_text(size = textSize-2),
+    legend.text = element_text(size = 8),
+    axis.text = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, 'mm'),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black')
+  )
+q
+# ggsave(here::here('plots_man/monthly_ci_gps.png'), q, units = 'in', width = 9, height = 2.5)
+
+```
+
+```{r}
+
+m <- cowplot::plot_grid(p,q, nrow =2, labels = c('A','B'), label_fontface = 'plain', hjust = -3)
+m
+
+ggsave(here::here('plots_man/monthly_dens_ci_gps.png'), m, units = 'in', width = 9, height = 5)
+
+```
+
+### Figure 6: Compare density by license area
+
+Plot densities by license area.
+
+```{r}
+
+od <- here::here('plots_man/all_risks')
+
+out <- extract_dens(source = od, extract_areas = ogl, modlab = 'Breeding')
+
+out <- out |> 
+  dplyr::group_by(ProdArea,area_km2,Province,license_type,colony,month) |> 
+  dplyr::summarise(
+    med = sum(med),
+    ll = sum(ll),
+    ul = sum(ul)
+  )
+
+month_sum <- out |> 
+  dplyr::group_by(Province, ProdArea, month, license_type) |> 
+  dplyr::summarise(
+    dens_med = sum(med),
+    dens_ll = sum(ll),
+    dens_ul = sum(ul)
+  )
+
+ggplot() +
+  geom_bar(data = out, aes(y = ProdArea, x = med, fill = colony), stat = 'identity') +
+  scale_fill_viridis_d(option = 'H', direction = -1) +
+  geom_errorbarh(data = month_sum, aes(y = ProdArea, xmin = dens_ll, xmax = dens_ul), height = 0) +
+  geom_hline(yintercept = 7.5, linetype = 3) +
+  facet_wrap(.~month, ncol = 1, dir = 'v') +
+  labs(x = expression('Density, birds/km'^2), y = 'Licence Area', fill = '') +
+  theme(
+    text = element_text(size = textSize),
+    axis.text.y = element_text(size = 8),
+    legend.margin= ggplot2::margin(1, 1, 1, 1, 'mm'),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, 'mm'),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black')
+  )
+# ggsave(here::here('plots_man/License area densities by month.png'),
+#        units = 'in', width = 6.5, height = 7)
+
+```
+
+### Figure 7: Light risk - compare nBirds by license area
+
+Extract mean densities exposed to light risk by production area. 
+
+```{r extract-light-risk}
+
+od <- here::here('plots_man/light_risks')
+
+out <- extract_dens(source = od, extract_areas = ogl, modlab = 'Breeding')
+out <- out |> 
+  dplyr::group_by(ProdArea,area_km2,Province,license_type,colony,month) |> 
+  dplyr::summarise(
+    med = sum(med),
+    ll = sum(ll),
+    ul = sum(ul)
+  )
+
+```
+
+Calculate the number of birds within a theoretical 89.3 km^2 light footprint if it were within each lease area. Generate barplots of results for number of birds.
+
+```{r light-nbirds}
+
+light_buff <- 89.3
+out_bs <- out |> 
+  dplyr::mutate(
+    med = med * light_buff,
+    ll = ll * light_buff,
+    ul = ul * light_buff,
+  )
+
+month_sum_bs <- out_bs |> 
+  dplyr::group_by(Province, ProdArea, month, license_type) |> 
+  dplyr::summarise(
+    dens_med = sum(med),
+    dens_ll = sum(ll),
+    dens_ul = sum(ul)
+  )
+
+ggplot() +
+  geom_bar(data = out_bs, aes(y = ProdArea, x = med, fill = colony), stat = 'identity') +
+  scale_fill_viridis_d(option = 'H', direction = -1) +
+  geom_errorbarh(data = month_sum_bs, aes(y = ProdArea, xmin = dens_ll, xmax = dens_ul), height = 0) +
+  facet_wrap(.~month, ncol = 1) +
+  geom_hline(yintercept = 7.5, linetype = 3) +
+  labs(x = 'Number of birds within light footprint', y = 'Licence Area', fill = '') +
+  theme(
+    text = element_text(size = textSize),
+    axis.text.y = element_text(size = 8),
+    legend.margin= ggplot2::margin(1, 1, 1, 1, 'mm'),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, 'mm'),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black')
+  )
+
+# ggsave(here::here('plots_man/Light risk birds by month.png'), 
+#        units = 'in', width = 6.5, height = 7)
+
+```
+
+Calculate the proportion of population impacted by light pollution in a representative sample of licence areas.
+
+```{r light-pop}
+
+pa_list <- c('Sea Rose','South Venture','EN_1166','EN_1172','JDA_1164','SEN_1162')
+
+out_pp <- out_bs |> 
+  dplyr::inner_join(colgrid[,c('colony','population')]) |> 
+  dplyr::filter(month == 'September', 
+                ProdArea %in% pa_list) |> 
+  dplyr::mutate(
+    med = (med/population) * 100,
+    ll = (ll/population) * 100,
+    ul = (ul/population) * 100,
+    colony = factor(colony, levels = colord[length(colord):1]),
+    ProdArea = factor(ProdArea, levels = pa_list)
+  ) 
+
+plot_ALAN_pop <- ggplot() +
+  geom_bar(data = out_pp, aes(y = colony, x = med, fill = colony), stat = 'identity') +
+  scale_fill_viridis_d(option = 'H', direction = 1) +
+  geom_errorbarh(data = out_pp, aes(y = colony, xmin = ll, xmax = ul), height = 0) +
+  facet_wrap(.~ProdArea, nrow = 2) +
+  guides(fill = 'none') +
+  labs(x = 'Percentage of population (%) within light footprint', y = 'Colony', fill = '') +
+  xlim(c(0, 0.06)) +
+  theme(
+    text = element_text(size = 10),
+    axis.text.y = element_text(size = 8),
+    legend.margin= ggplot2::margin(1, 1, 1, 1, 'mm'),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, 'mm'),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black')
+  )
+plot_ALAN_pop
+# ggsave(here::here('plots_man/Light risk percent by colony.png'), 
+#        units = 'in', width = 6.5, height = 4)
+```
+
+### Figure 8: Oil risk - compare nBirds by license area
+
+Extract mean densities exposed to oil risk by production area. 
+
+```{r extract-oil-risk}
+
+od <- here::here('plots_man/oil_risks')
+
+out <- extract_dens(source = od, extract_areas = ogl, modlab = 'Breeding')
+
+out <- rbind(out) |> 
+  dplyr::group_by(ProdArea,area_km2,Province,license_type,colony,month) |> 
+  dplyr::summarise(
+    med = sum(med),
+    ll = sum(ll),
+    ul = sum(ul)
+  )
+
+oil_buff <- 200
+out_bs <- out |> 
+  dplyr::mutate(
+    med = med * oil_buff,
+    ll = ll * oil_buff,
+    ul = ul * oil_buff,
+  )
+
+month_sum_bs <- out_bs |> 
+  dplyr::group_by(Province, ProdArea, month, license_type) |> 
+  dplyr::summarise(
+    dens_med = sum(med),
+    dens_ll = sum(ll),
+    dens_ul = sum(ul)
+  )
+
+ggplot() +
+  geom_bar(data = out_bs, aes(y = ProdArea, x = med, fill = colony), stat = 'identity') +
+  scale_fill_viridis_d(option = 'H', direction = -1) +
+  geom_errorbarh(data = month_sum_bs, aes(y = ProdArea, xmin = dens_ll, xmax = dens_ul), height = 0) +
+  facet_wrap(.~month, ncol = 1) +
+  geom_hline(yintercept = 7.5, linetype = 3) +
+  labs(x = 'Number of birds within oiled area', y = 'Licence Area', fill = '') +
+  theme(
+    text = element_text(size = textSize),
+    axis.text.y = element_text(size = 8),
+    legend.margin= ggplot2::margin(1, 1, 1, 1, 'mm'),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, 'mm'),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black')
+  )
+
+# ggsave(here::here('plots_man/Oil risk birds by month.png'), 
+#        units = 'in', width = 6.5, height = 7)
+
+```
+
+Calculate the proportion of population impacted for an oiling event in a representative sample of licence areas.
+
+```{r oil-pop}
+
+pa_list <- c('Sea Rose','South Venture','EN_1166','EN_1172','JDA_1164','SEN_1162')
+
+out_pp <- out_bs |> 
+  dplyr::inner_join(colgrid[,c('colony','population')]) |> 
+  dplyr::filter(month == 'September', 
+                ProdArea %in% pa_list) |> 
+  dplyr::mutate(
+    med = (med/population) * 100,
+    ll = (ll/population) * 100,
+    ul = (ul/population) * 100,
+    colony = factor(colony, levels = colord[length(colord):1]),
+    ProdArea = factor(ProdArea, levels = pa_list)
+  ) 
+
+plot_OR_pop <- ggplot() +
+  geom_bar(data = out_pp, aes(y = colony, x = med, fill = colony), stat = 'identity') +
+  scale_fill_viridis_d(option = 'H', direction = 1) +
+  geom_errorbarh(data = out_pp, aes(y = colony, xmin = ll, xmax = ul), height = 0) +
+  facet_wrap(.~ProdArea, nrow = 2) +
+  guides(fill = 'none') +
+  labs(x = 'Percentage of population (%) within oiled area', y = 'Colony', fill = '') +
+  xlim(c(0, 0.06)) +
+  theme(
+    text = element_text(size = 10),
+    axis.text.y = element_text(size = 8),
+    legend.margin= ggplot2::margin(1, 1, 1, 1, 'mm'),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, 'mm'),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black')
+  )
+
+plot_OR_pop
+
+# ggsave(here::here('plots_man/Oil risk percent by colony.png'), 
+#        units = 'in', width = 6.5, height = 4)
+
+```
+
+### Figure S1: HMM step lengths and turning angles
+
+Generated in HMM script
+
+### Figure S2: Map pseudo-absences
+
+Map showing distribution of observations and pseudo-absences.
+
+```{r}
+
+dat <- readRDS(here::here('input_data/LHSP_locs_plus_PA.RDS')) |>
+  dplyr::ungroup() |> sf::st_transform(crs = mp)
+
+colonies <- sf::st_as_sf(colgrid, coords = c('collon', 'collat'), crs = 4326, remove = FALSE) |> 
+  sf::st_transform(crs = mp) |> 
+  dplyr::filter(colony %in% unique(dat$colony))
+
+pal <- viridis::viridis(n = 2)
+
+dat$obs <- factor(dat$obs)
+dat$obs <- factor(dat$obs, labels = c('Pseudo-absences','Observations'))
+dat$obs <- factor(dat$obs, levels = c('Observations','Pseudo-absences'))
+dat$colony <- factor(dat$colony, levels = colord)
+
+temp <- dat[seq(1, nrow(dat), 5),]
+
+bb <- sf::st_bbox(temp)
+
+p <- ggplot() +
+  geom_sf(data = temp, aes(col = obs), alpha = 0.05, size = 0.9) +
+  geom_sf(data = temp[temp$obs == 'Observations',], aes(col = obs), alpha = 0.01, size = 0.9) +
+  scale_colour_viridis_d(direction = 1) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  geom_sf(data = eez, fill = 'transparent', linetype = 2, linewidth = 0.5) +
+  geom_sf(data = coast_mp, fill = grey(0.9), linewidth = 0.1) +
+  geom_sf(data = colonies, size = 2) +
+  # scale_color_manual(values = c(`0`=pal[2],`1`=pal[1]), show_guide=TRUE) + 
+  facet_wrap(.~factor(colony, levels = colord), nrow = 2) +
+  scale_y_continuous(breaks = seq(0, 80, 10)) +
+  scale_x_continuous(breaks = seq(-80, 80, 20)) +
+  coord_sf(xlim = bb[c(1, 3)], ylim = bb[c(2,4)]) +
+  labs(x = '', y= '', color = '') +
+  theme(
+    text = element_text(size = 8),
+    legend.position = 'bottom',
+    legend.margin= ggplot2::margin(0, 0, 0, 0, 'mm'),
+    plot.margin = ggplot2::margin(0, 0, 0, 0, 'mm'),
+    strip.background = element_rect(fill = 'transparent'),
+    strip.text = element_text(colour = 'black')
+  )
+print(p)
+
+# ggsave(here::here('plots_man/map_pas.png'), p, units = 'in', width = 6.5, height = 5)
+
+```
+
+### Figure S3-S5: Locations by HMM state
+
+Map GPS locations with HMM behaviour classifications by colony.
+
+```{r}
+
+# Read in tracking data, project
+tracks <- readRDS(here::here("input_data/HMM_classified_data.rds")) |>
+  sf::st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) |>
+  sf::st_transform(crs = mp)
+
+# project colonies
+trackCols <- colgrid |>
+  dplyr::filter(colony %in% c("Baccalieu", "Gull", "Middle Lawn", "Country", "Bon Portage", "Kent")) |>
+  dplyr::rename(colonyBasic = colony) |>
+  dplyr::mutate(colonyBasic = factor(colonyBasic, ordered = T, levels = c("Baccalieu", "Gull", "Middle Lawn", "Country", "Bon Portage", "Kent"))) |> 
+  sf::st_as_sf(coords = c("collon", "collat"), crs = 4326) |>
+  sf::st_transform(crs = mp)
+
+## Get plot extent based off tracking data, plus some wiggle room
+bb <- sf::st_bbox(tracks)
+bb[1] <- bb[1] - 100000
+bb[2] <- bb[2] - 100000
+bb[3] <- bb[3] + 100000
+bb[4] <- bb[4] + 100000
+
+## ALL STATES
+
+#Palette
+pal3 <- c("#56B4E9", "#009E73", "#E69F00")
+
+# Multipanel plot by colony
+# Color by behaviour
+p <- bath_base +
+  facet_wrap(~colonyBasic) +
+  geom_sf(data = tracks, aes(fill = states3_cov), pch = 21, size = 0.5, stroke = 0.1) +
+  scale_fill_manual(values = pal3, labels = c("Transit (in-air)", "Extensive search (in-air)", "Intensive search (on-water)")) + 
+  geom_sf(data = trackCols, pch = 21, fill = "white", size = 1.5) +
+  geom_sf(data = eez, fill = 'transparent', linetype = 2, linewidth = 0.1) +
+  coord_sf(xlim = c(bb[1], bb[3]), ylim = c(bb[2], bb[4])) +
+  labs(x = '', y = '', fill = '') +
+  guides(fill = guide_legend(reverse = T, override.aes = list(size = 1.5))) +
+  theme(
+    text = element_text(size = textSize),
+    legend.position = 'bottom',
+    legend.margin= ggplot2::margin(0, 0, 0, 0, 'mm'),
+    plot.margin = ggplot2::margin(0, 0, 0, 0, 'mm'),
+    strip.background = element_blank(),
+    strip.text = element_text(colour = 'black')
+  )
+
+print(p)
+
+# ggsave(here::here('plots_man/TrackPtsHMM_byColony.png'), p, units = 'in', width = 9, height = 5.5)
+
+
+## Foraging only
+
+p <- bath_base +
+  facet_wrap(~colonyBasic) +
+  geom_sf(data = tracks[which(tracks$states3_cov == "Intensive search"),], fill = "#E69F00", pch = 21, size = 0.5, stroke = 0.1) +
+  geom_sf(data = trackCols, pch = 21, fill = "white", size = 1.5) +
+  geom_sf(data = eez, fill = 'transparent', linetype = 2, linewidth = 0.1) +
+  coord_sf(xlim = c(bb[1], bb[3]), ylim = c(bb[2], bb[4])) +
+  labs(x = '', y = '', fill = '') +
+  guides(fill = guide_legend(reverse = T, override.aes = list(size = 1.5))) +
+  theme(
+    text = element_text(size = textSize),
+    legend.position = 'bottom',
+    legend.margin= ggplot2::margin(0, 0, 0, 0, 'mm'),
+    plot.margin = ggplot2::margin(0, 0, 0, 0, 'mm'),
+    strip.background = element_blank(),
+    strip.text = element_text(colour = 'black')
+  )
+
+print(p)
+
+# ggsave(here::here('plots_man/TrackPtsHMM_byColony_forageOnly.png'), p, units = 'in', width = 9, height = 5.5)
+
+
+## Search only
+p <- bath_base +
+  facet_wrap(~colonyBasic) +
+  geom_sf(data = tracks[which(tracks$states3_cov == "Extensive search"),], fill = "#009E73", pch = 21, size = 0.5, stroke = 0.1) +
+  geom_sf(data = trackCols, pch = 21, fill = "white", size = 1.5) +
+  geom_sf(data = eez, fill = 'transparent', linetype = 2, linewidth = 0.1) +
+  coord_sf(xlim = c(bb[1], bb[3]), ylim = c(bb[2], bb[4])) +
+  labs(x = '', y = '', fill = '') +
+  guides(fill = guide_legend(reverse = T, override.aes = list(size = 1.5))) +
+  theme(
+    text = element_text(size = textSize),
+    legend.position = 'bottom',
+    legend.margin= ggplot2::margin(0, 0, 0, 0, 'mm'),
+    plot.margin = ggplot2::margin(0, 0, 0, 0, 'mm'),
+    strip.background = element_blank(),
+    strip.text = element_text(colour = 'black')
+  )
+
+print(p)
+
+# ggsave(here::here('plots_man/TrackPtsHMM_byColony_searchOnly.png'), p, units = 'in', width = 9, height = 5.5)
+
+
+## Transit only
+p <- bath_base +
+  facet_wrap(~colonyBasic) +
+  geom_sf(data = tracks[which(tracks$states3_cov == "Transit"),], fill = "#56B4E9", pch = 21, size = 0.5, stroke = 0.1) +
+  geom_sf(data = trackCols, pch = 21, fill = "white", size = 1.5) +
+  geom_sf(data = eez, fill = 'transparent', linetype = 2, linewidth = 0.1) +
+  coord_sf(xlim = c(bb[1], bb[3]), ylim = c(bb[2], bb[4])) +
+  labs(x = '', y = '', fill = '') +
+  guides(fill = guide_legend(reverse = T, override.aes = list(size = 1.5))) +
+  theme(
+    text = element_text(size = textSize),
+    legend.position = 'bottom',
+    legend.margin= ggplot2::margin(0, 0, 0, 0, 'mm'),
+    plot.margin = ggplot2::margin(0, 0, 0, 0, 'mm'),
+    strip.background = element_blank(),
+    strip.text = element_text(colour = 'black')
+  )
+
+print(p)
+
+# ggsave(here::here('plots_man/TrackPtsHMM_byColony_transitOnly.png'), p, units = 'in', width = 9, height = 5.5)
+
+## Summary
+test <- tracks |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(region, states3_cov) |>
+  dplyr::summarize(nVal = dplyr::n())
+
+```
+
+### Figure S6-S11: Tracks with OOG by colony
+
+```{r}
+
+dat <- readRDS(here::here('input_data/data_tracks_simplified.rds')) |> 
+  sf::st_transform(crs = mp)
+
+# Tracking data
+tracks <- dat |>
+  dplyr::group_by(ID) |>
+  dplyr::summarize(do_union=FALSE) |>
+  sf::st_cast("LINESTRING") 
+
+
+# Return covariates to dataset
+covs <- dat |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(ID) |>
+  dplyr::summarize(colony = colony[1], 
+                   status = status[1]) |>
+  dplyr::mutate(colony = factor(colony, ordered = T, levels = c("Baccalieu", "Gull", "Middle Lawn", "Country", "Bon Portage", "Kent")),
+                status = ifelse(status == "incubation", "Incubation", "Chick-rearing"),
+                status = factor(status, ordered = T, levels = c("Incubation", "Chick-rearing"))) 
+
+tracks <- dplyr::left_join(tracks, covs, by = "ID") 
+
+# project colonies
+trackCols <- colgrid |>
+  dplyr::filter(colony %in% c("Baccalieu", "Gull", "Middle Lawn", "Country", "Bon Portage", "Kent")) |>
+  sf::st_as_sf(coords = c("collon", "collat"), crs = 4326) |>
+  sf::st_transform(crs = mp)
+
+# Plot for each colony in a loop
+# Each will need its own bbox
+
+for(i in c('Baccalieu', 'Gull', 'Kent')) {
+  
+  bb2 <- sf::st_bbox(tracks[which(tracks$colony == i),]) 
+  bb2[1] <- bb2[1] - 100000
+  bb2[2] <- bb2[2] - 100000
+  bb2[3] <- bb2[3] + 100000
+  bb2[4] <- bb2[4] + 100000
+  
+  # Tring to change ratio to fit exact plot dimentions, but struggling. Decided just to crop the outputs.
+  #pRatio <- (-bb2[2]+bb2[4])/((-bb2[1]+bb2[3])*2)
+  
+  p <- bath_base +
+    geom_sf(data = tracks[which(tracks$colony == i),], linewidth = 0.2) +
+    geom_sf(data = oog, aes(fill = Activity, color = Activity), alpha = 0.8, linewidth = 0.2) +
+    scale_fill_manual(values = c('#E69F00','#56B4E9','#009E73','#CC79A7')) +
+    scale_color_manual(values = c('#E69F00','#56B4E9','#009E73','#CC79A7'), guide = "none") +
+    geom_sf(data = trackCols[which(trackCols$colony == i),], fill = "white",pch = 21, size = 1.5) +
+    facet_wrap(~status) +
+    coord_sf(xlim = c(bb2[1], bb2[3]), ylim = c(bb2[2], bb2[4])) +
+    labs(x = '', y= '', fill = '') +
+    theme(
+      text = element_text(size = textSize),
+      legend.position = 'bottom',
+      legend.margin= ggplot2::margin(0, 0, 1, 0, 'mm'),
+      plot.margin = ggplot2::margin(0, 1, 0, 0, 'mm'),
+      legend.box.margin = margin(-5, 0, 0, 0, "mm"),  # pull legend upward
+      strip.background = element_blank(),
+      strip.text = element_text(colour = 'black')
+    )
+  
+  print(p)
+  
+  #ggsave(here::here(paste0('plots_man/Tracks_Petroleum_', i, '.png')), p, units = 'in', width = plotWid, height = plotHei)
+}
+
+
+for(i in c('Bon Portage', 'Country', 'Middle Lawn')) {
+  
+  bb2 <- sf::st_bbox(tracks[which(tracks$colony == i),]) 
+  bb2[1] <- bb2[1] - 100000
+  bb2[2] <- bb2[2] - 100000
+  bb2[3] <- bb2[3] + 100000
+  bb2[4] <- bb2[4] + 100000
+  
+  # Tring to change ratio to fit exact plot dimentions, but struggling. Decided just to crop the outputs.
+  #pRatio <- (-bb2[2]+bb2[4])/((-bb2[1]+bb2[3])*2)
+  
+  p <- bath_base +
+    facet_wrap(~status) +
+    geom_sf(data = tracks[which(tracks$colony == i),], linewidth = 0.2) +
+    geom_sf(data = oog, aes(fill = Activity, color = Activity), alpha = 0.8, linewidth = 0.1) +
+    scale_fill_manual(values = c('#E69F00','#56B4E9','#009E73','#CC79A7')) +
+    scale_color_manual(values = c('#E69F00','#56B4E9','#009E73','#CC79A7'), guide = "none") +
+    geom_sf(data = trackCols[which(trackCols$colony == i),], fill = "white",pch = 21, size = 1.5) +
+    #geom_sf(data = eez, fill = 'transparent', linetype = 2, linewidth = 0.1) +
+    coord_sf(xlim = c(bb2[1], bb2[3]), ylim = c(bb2[2], bb2[4])) +
+    labs(x = '', y= '', fill = '') +
+    theme(
+      text = element_text(size = textSize),
+      legend.position = 'bottom',
+      legend.margin= ggplot2::margin(0, 0, 1, 0, 'mm'),
+      plot.margin = ggplot2::margin(0, 1, 0, 0, 'mm'),
+      legend.box.margin = margin(-5, 0, 0, 0, "mm"),  # pull legend upward
+      strip.background = element_blank(),
+      strip.text = element_text(colour = 'black')
+    )
+  
+  print(p)
+  
+  #ggsave(here::here(paste0('plots_man/Tracks_Petroleum_', i, '.png')), p, units = 'in', width = plotWid, height = plotHei-1.5)
+}
+
+```
+
+### Figure S12: Pct of population exposed
+
+Percentage (%) of Leach’s Storm-petrel populations instantaneously exposed in September to A) ALAN from a typical offshore platform (with a light footprint of 89 km²), or B) oil pollution from a hypothetical spill (with a footprint of 200 km²) if it were located within different licence areas off the coasts of NL or NS. Examples are shown for September because this month had the highest densities of birds at risk. Note that estimates are instantaneous and represent the percentage of birds expected at a given time in September at each facility.    
+
+```{r}
+
+cowplot::plot_grid(
+  plot_ALAN_pop, plot_OR_pop, nrow = 2, labels = c('A','B'), label_fontface = 'plain', hjust = -3
+)
+# ggsave(here::here('plots_man/Combined risk percent by colony.png'), 
+#        units = 'in', width = 6.5, height = 7.5)
+
+```
+
+

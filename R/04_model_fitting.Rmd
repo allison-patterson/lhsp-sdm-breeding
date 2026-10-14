@@ -1,0 +1,298 @@
+---
+title: "model_fitting"
+author: "Allison Patterson"
+date: "`r Sys.Date()`"
+output: html_document
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+---
+
+In this script we select which predictors to model, identify the best hyper-parameters to use based on leave-on-out cross-validation (where each colony is left out in turn), and fit the 'final' BART model to our training data.
+
+```{r setup, include=FALSE}
+
+library(doParallel)
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
+# Load functions
+source(here::here("R/functions.R"), echo = F)
+
+getJava(java_loc)
+Sys.setenv(JAVA_HOME=java_loc)
+library(bartMachine)
+
+```
+
+## Read in training data
+
+Read in and map the training data. In the map below, observed locations are shown in purple and pseudo-absences are shown in yellow.
+
+*Convert the response variables obs into a factor with presence as the reference value, this is needed so that bartMachine fits a classification model instead of a regression model*
+
+```{r read-data}
+
+dat <- readRDS(here::here('input_data/LHSP_train_data.RDS')) |> 
+  dplyr::rename(bird_id = ID) |> 
+  dplyr::arrange(bird_id, date, obs) |> 
+  # Convert the response variables obs into a factor with presence as the reference value
+  # this is needed so that bartMachine fits a classification model instead of a regression model
+  dplyr::mutate(
+    obs = factor(obs, labels = c('absence','presence')),
+    obs = factor(obs, levels = c('presence','absence')),
+  )
+
+# remove NAs
+dat <- na.omit(dat) 
+
+bb <- seabiRds::bbox_at_zoom(dat)
+
+p <- ggplot() +
+  geom_sf(data = coast, fill = grey(0.9), linewidth = 0.3) +
+  geom_sf(data = dat, aes(col = factor(obs)), alpha = 0.05) +
+  scale_color_viridis_d(direction = -1) +
+  coord_sf(xlim = bb[c(1,3)], ylim = bb[c(2,4)]) +
+  labs(x = '', y = '', color = 'obs')
+print(p)
+
+dat <- data.frame(sf::st_drop_geometry(dat))
+
+```
+
+## Set predictors to use in model
+
+```{r select-preds}
+
+myvars <- c('obs','collat','collon','region', 'logpop',
+            'state','daynight', 'status',
+            "elevation","slope","coastdist","shelfdist","competition","colonydist",  
+            "chl","current","currsd","mlotst","mnkc_epi","mnkc_hmlmeso","mnkc_mumeso", 
+            "nppv","so","ssha","sshsd","sstsd","thetao","zooc")
+
+```
+
+## Custom model hypertuning 
+
+bartMachine provides a function for hypertuning, but we opted for a custom approach that gives us more control over cross-validation.
+
+BART models have two hyper-parameters that influence the performance of classification (probability) models: the number of trees (num_trees) and k. This section uses a leave-one-out cross validation to determine which values of hyper-parameters provide the best predictive performance.
+
+Data are split into folds based on colony. For each combination of hyper-parameters one colony is left out as testing data and train the model on the remaining colony. Predictions from that model are made to the test data and compared to observed data to estimate model performance based on the area-under-curve statistic. This process is repeated for 9 combinations of num_trees and k, for each of the 6 colonies (54 iterations).
+
+*Could consider dropping repeats to save time*
+
+```{r hyper-bart2}
+
+tg <- expand.grid(
+  colony = unique(dat$colony),
+  num_trees = c(100,200,300),
+  k = c(2,3),
+  iter = 1:5
+)
+
+out <- vector('list', length = nrow(tg))
+
+out_dir <- here::here('output_data/hypertuning')
+
+if (dir.exists(out_dir) == FALSE) dir.create(out_dir)
+
+```
+
+We parallel the model fitting process to speed up how long it takes to run the hyper-tuning. Best performance is achieved if we only assign 20 GB of RAM to each cluster. If this is being run on a computer with limited RAM or cores, these values may need to be adjusted.
+
+We are only saving out model predictions and 90% CI, along with the underlying observation type and state. This was done to save memory, however if we want to use the LOOCV prediction in model performance evaluation we should save out the actual models. This would only be feasible if we drop the repeats.
+
+```{r}
+
+myCluster <- makeCluster(20)
+registerDoParallel(myCluster)
+
+tt <- system.time({
+  out <- foreach(i=1:nrow(tg)) %dopar% {
+    
+    options(java.parameters = "-Xmx20g")
+    library(bartMachine)
+    
+    train <- dat |> dplyr::filter(colony != tg$colony[i]) |> data.frame()
+    test <- dat |> dplyr::filter(colony == tg$colony[i])
+    
+    mod <- bartMachine::bartMachine(X  = train[,myvars[2:length(myvars)]], 
+                                    y = train$obs,
+                                    num_trees = tg$num_trees[i], 
+                                    k = tg$k[i], 
+                                    num_burn_in = 500,
+                                    num_iterations_after_burn_in = 250,
+                                    flush_indices_to_save_RAM = T,
+                                    mem_cache_for_speed = F, 
+                                    serialize = F,
+                                    verbose = FALSE)
+    pred <- bartMachine::bart_machine_get_posterior(mod, new_data = test[,myvars[2:length(myvars)]])
+    
+    saveRDS(data.frame(obs = test$obs, 
+                       pred = pred$y_hat, 
+                       ll = apply(pred$y_hat_posterior_samples, 1, quantile, 0.05),
+                       ul = apply(pred$y_hat_posterior_samples, 1, quantile, 0.95),
+                       state = test$state, daynight = test$daynight,status = test$status), 
+            paste0(out_dir, '/', tg$colony[i], '_', tg$num_trees[i], '_', tg$k[i], '_', tg$iter[i],'.RDS')
+    )
+    rm(mod)
+    gc()
+  }
+})[3]
+
+stopCluster(myCluster)
+gc()
+
+print(paste('Total hypertuning time:', tt))
+
+```
+
+### ID best hyper-parameters by AUC
+
+This compares the AUC value with different hyperparameters. There is not much variation in AUC. This could be because BART models are not very sensitive to hypertuning. 
+
+```{r}
+
+fn <- list.files(out_dir, full.names = T)
+out <- lapply(fn, FUN = function(x) readRDS(x))
+tg$auc <- sapply(1:length(out), function(x) pROC::auc(pROC::roc(out[[x]]$obs, out[[x]]$pred))[1])
+saveRDS(tg, here::here('output_data/bart_tune_grid.RDS'))
+
+ggplot(tg, aes(x = colony, y = auc, fill = factor(k))) +
+  geom_boxplot() +
+  facet_grid(cols = vars(num_trees)) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+best_hp <- tg |> 
+  dplyr::group_by(k, num_trees) |> 
+  dplyr::summarize(
+    mean_auc = mean(auc)
+  ) |> 
+  dplyr::ungroup() |> 
+  dplyr::slice_max(mean_auc, n = 1)
+
+best_hp
+
+m <- nlme::lme(auc ~ factor(num_trees) * factor(k), tg, random = ~1|colony)
+
+plot(ggeffects::ggemmeans(m, terms = ~num_trees * k))
+
+```
+
+## Fit BART model to training data
+
+This fits the model with values of k=2 and num_trees=200 to the full training data set. 
+
+Note that we are using more iterations for burn_in and have turned on serialization so that the output model can be saved and used for prediction in a new session.
+
+```{r fit-bart}
+
+myCluster <- makeCluster(1)
+registerDoParallel(myCluster)
+
+mod <- foreach(i=1) %dopar% {
+  
+  options(java.parameters = "-Xmx200g")
+  bartMachine::set_bart_machine_num_cores(2)
+  
+  bartMachine::bartMachine(X  = dat[,myvars[2:length(myvars)]], 
+                           y = dat$obs,
+                           num_trees = 200,
+                           k = 2, 
+                           num_burn_in = 1000,
+                           num_iterations_after_burn_in = 250,
+                           flush_indices_to_save_RAM = T,
+                           mem_cache_for_speed = F, 
+                           serialize = TRUE, # important for predicting from the model in new R session
+                           verbose = TRUE)
+  
+  
+}
+stopCluster(myCluster)
+saveRDS(mod[[1]], here::here('output_data/bart_model_full.RDS'))
+
+```
+
+### Get dynamic model variable inclusion rate
+
+This calculates the proportion of splits that use each variable for their splitting rule. It is an indicator of how important each predictor is for the model.Note: I have tried doing this with the argument type = 'trees', but this seems to be uninformative.
+
+```{r}
+
+mod <- readRDS(here::here('output_data/bart_model_full.RDS'))
+
+myCluster <- makeCluster(1)
+registerDoParallel(myCluster)
+
+imp <- foreach(i=1) %dopar% {
+  
+  options(java.parameters = "-Xmx30g")
+  
+  bartMachine::set_bart_machine_num_cores(20)
+  
+  bartMachine::investigate_var_importance(mod, num_replicates_for_avg = 5,
+                                          num_trees_bottleneck = 20, type = "splits", plot = FALSE)
+  
+}
+
+stopCluster(myCluster)
+gc()
+
+saveRDS(imp[[1]], here::here('output_data/bart_model_full_imp.RDS'))
+
+```
+
+Make a pretty plot of the result. 
+
+```{r}
+
+imp <- readRDS(here::here('output_data/bart_model_full_imp.RDS'))
+
+tt <- data.frame(
+  var = names(imp$avg_var_props),
+  imp = imp$avg_var_props,
+  sd = imp$sd_var_props
+)
+tt$var <- factor(tt$var, tt$var[order(tt$imp, decreasing = TRUE)])
+tt <- tt |> 
+  dplyr::arrange(desc(imp)) |> 
+  dplyr::mutate(
+    type = dplyr::case_when(var %in% c('colonydist','coastdist','competition','logpop','collat',          
+                                       'shelfdist','elevation','collon','collat', 'slope',
+                                       'region_SS','region_NL') ~ 'static',
+                            var %in% c('so','thetao', 'chl','nppv','mnkc_hmlmeso','zooc','mnkc_epi', 
+                                       'ssha','mnkc_mumeso','slope','sstsd','sshsd', 
+                                       'mlotst','currsd','current') ~ 'dynamic',
+                            var %in% c('status_chick-rearing','status_incubation',
+                                       'state_Foraging','state_Transit',
+                                       'daynight_day','daynight_night') ~ 'conditional'),
+    cumsum = cumsum(imp),
+  )
+
+tt |> 
+  dplyr::group_by(type) |> 
+  dplyr::summarise(
+    median = median(imp),
+    sum = sum(imp)
+  )
+
+ggplot() +
+  geom_bar(data = tt, aes(x = var, y = imp, fill = type), stat = 'identity') +
+  geom_errorbar(data = tt, aes(x = var, ymin = imp - sd, ymax = imp + sd), width = 0) +
+  labs(x = 'Predictor variable', y = 'Variable inclusion', fill = 'Type') +
+  theme(
+    text = element_text(size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ggplot() +
+  geom_point(data = tt, aes(x = var, y = cumsum, col = type)) +
+  ylim(c(0,1)) +
+  labs(x = 'Predictor variable', y = 'Cumulative variable inclusion', col = 'Type') +
+  theme(
+    text = element_text(size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```

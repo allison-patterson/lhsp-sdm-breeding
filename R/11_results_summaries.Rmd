@@ -1,0 +1,456 @@
+---
+title: "results_summaries"
+author: "Allison Patterson, Katharine Studholme"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+---
+
+This script generates summaries used in the manuscript.
+
+```{r setup, include=FALSE}
+
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
+
+# Load functions
+source(here::here("R/functions.R"), echo = F)
+ogl <- readRDS(here::here('raw_data/threats/OGL_polygons.rds'))
+colgrid <- readRDS(paste0(envir,'/colonies.RDS'))
+
+```
+
+### Table S3: Summarize tracking effort
+
+```{r}
+
+dep <- read.csv(here::here("raw_data/MasterMetadata_LHSP_Tracking_NL_NB_NS_13Aug2024_GPSonly.csv"))|>
+  dplyr::filter(colony != "Scatarie") |>
+  dplyr::mutate(dep_brStatus = ifelse(is.na(dep_brStatus), "incubation", dep_brStatus),
+                dep_brStatus = ifelse(dep_brStatus == "none", "incubation", dep_brStatus),
+                colony = ifelse(grepl("Baccalieu", colony), "Baccalieu", colony))
+# 'NA' and 'none' breeding status deploy dates all late June or early July, assume incubation for retrieval stats
+
+sum <- dep |> 
+  dplyr::group_by(colony, dep_yr, dep_brStatus) |>
+  dplyr::summarize(nDep = dplyr::n(),
+                   nRecap = sum(ret_birdYN == "y", na.rm = T),
+                   nRet = sum(ret_tagYN == "y", na.rm = T),
+                   nData = sum(!is.na(track_filename), na.rm = T),
+                   .groups = "drop_last") |>
+  tidyr::pivot_wider(
+    names_from = dep_brStatus,
+    values_from = c(nDep, nRecap, nRet, nData),
+    names_glue = "{dep_brStatus}_{.value}",
+    names_vary = "slowest"
+  )
+
+write.csv(sum, here::here('plots_man/tracking_effort_summary.csv'), row.names = F)
+
+```
+
+### Summarize densities over all colonies
+
+Make overall summaries of density for each month.
+
+```{r}
+
+od <- here::here('plots_man/density_summaries')
+
+for (dd in c('day','night')) {
+  sdm_density_rast(colony = 'all', 
+                   date = month.abb[6:9], 
+                   brStatus = c('incubation','chick-rearing'), 
+                   behaviour = c('Foraging','Transit'), 
+                   tod = dd, 
+                   sunLoc = c(-52.7988, 48.1165),    # defaults to Baccalieu
+                   source = here::here('output_data/ltm_bart_birds'), 
+                   destination = od
+  )
+}
+
+sdm_density_rast(colony = 'all',
+                 date = month.abb[6:9],
+                 brStatus = c('incubation','chick-rearing'),
+                 behaviour = c('Foraging','Transit'),
+                 tod = c('day','night'),
+                 sunLoc = c(-52.7988, 48.1165),    # defaults to Baccalieu
+                 source = here::here('output_data/ltm_bart_birds'),
+                 destination = od
+)
+
+```
+
+
+### Table S7: Calculate densities by area
+
+Summarize densities across status, behaviour, and time of day.
+
+```{r}
+
+od <- here::here('plots_man/all_risks')
+
+lapply(colord, function(cn) {
+  sdm_density_rast(colony = cn,
+                   date = month.abb[6:9],
+                   brStatus = c('incubation','chick-rearing'),
+                   behaviour = c('Foraging','Transit'),
+                   tod = c('day','night'),
+                   sunLoc = c(-52.7988, 48.1165),    # defaults to Baccalieu
+                   source = here::here('output_data/ltm_bart_birds'),
+                   destination = od
+  )
+})
+
+```
+
+Extract densities within the licence areas. 
+
+```{r}
+
+out <- extract_dens(source = od, extract_areas = ogl, modlab = 'Breeding')
+
+out <- out |> 
+  dplyr::group_by(ProdArea,area_km2,Province,license_type,colony,month) |> 
+  dplyr::summarise(
+    med = sum(med),
+    ll = sum(ll),
+    ul = sum(ul)
+  )
+
+month_sum <- out |> 
+  dplyr::group_by(Province, ProdArea, month, license_type) |> 
+  dplyr::summarise(
+    dens_med = sum(med),
+    dens_ll = sum(ll),
+    dens_ul = sum(ul)
+  )
+
+month_sum |> 
+  dplyr::mutate(
+    value = paste0(round(dens_med,2), ' (', round(dens_ll,2), '-', round(dens_ul, 2), ')')
+  ) |> 
+  dplyr::select(-dens_med, -dens_ll, -dens_ul) |> 
+  tidyr::pivot_wider(names_from = month, values_from = value) |> 
+  dplyr::arrange(desc(ProdArea), license_type, Province) |> 
+  dplyr::rename(Area = ProdArea, `License type`= license_type) |> 
+  dplyr::select(`License type`, Province, Area, month.name[6:9]) |> 
+  write.csv(here::here('plots_man/all_risk_summary.csv'),row.names = F)
+
+```
+
+### Table S8: Calculate numbers of birds experiencing light risks
+
+Summarize densities of birds within light footprint at night.
+
+```{r create-light-risk-rast}
+
+od <- here::here('plots_man/light_risks')
+
+lapply(colord, function(cn) {
+  sdm_density_rast(colony = cn,
+                   date = month.abb[6:9],
+                   brStatus = c('incubation','chick-rearing'),
+                   behaviour = c('Foraging','Transit'),
+                   tod = c('night'),
+                   sunLoc = c(-52.7988, 48.1165),# defaults to Baccalieu
+                   source = here::here('output_data/ltm_bart_birds'),
+                   destination = od
+  )
+})
+
+```
+
+Extract mean densities by production area. 
+
+```{r extract-light-risk}
+
+out <- extract_dens(source = od, extract_areas = ogl, modlab = 'Breeding')
+
+out <- out |> 
+  dplyr::group_by(ProdArea,area_km2,Province,license_type,colony,month) |> 
+  dplyr::summarise(
+    med = sum(med),
+    ll = sum(ll),
+    ul = sum(ul)
+  )
+
+month_sum <- out |> 
+  dplyr::group_by(Province, ProdArea, month, license_type) |> 
+  dplyr::summarise(
+    dens_med = sum(med),
+    dens_ll = sum(ll),
+    dens_ul = sum(ul)
+  )
+
+```
+
+Calculate the number of birds within a theoretical 89.3 km^2 light footprint if it were within each lease area. 
+
+```{r light-nbirds}
+
+light_buff <- 89.3
+out_bs <- out |> 
+  dplyr::mutate(
+    med = med * light_buff,
+    ll = ll * light_buff,
+    ul = ul * light_buff,
+  )
+
+month_sum_bs <- out_bs |> 
+  dplyr::group_by(Province, ProdArea, month, license_type) |> 
+  dplyr::summarise(
+    dens_med = sum(med),
+    dens_ll = sum(ll),
+    dens_ul = sum(ul)
+  )
+
+month_sum_bs |> 
+  dplyr::mutate(
+    value = paste0(round(dens_med,1), ' (', round(dens_ll,1), '-', round(dens_ul, 1), ')')
+  ) |> 
+  dplyr::select(-dens_med, -dens_ll, -dens_ul) |> 
+  tidyr::pivot_wider(names_from = month, values_from = value) |> 
+  dplyr::arrange(desc(ProdArea), license_type, Province) |> 
+  dplyr::rename(Area = ProdArea, `License type`= license_type) |> 
+  dplyr::select(`License type`, Province, Area, June, July, August,September) |> 
+  write.csv(here::here('plots_man/light_risk_summary.csv'),row.names = F)
+
+```
+
+### Table S9: Calculate number of birds experiencing oil risks
+
+Summarize densities of birds within oil spill area on water.
+
+```{r create-oil-risk-rast}
+
+od <- here::here('plots_man/oil_risks')
+
+lapply(colord, function(cn) {
+  sdm_density_rast(colony = cn,
+                   date = month.abb[6:9],
+                   brStatus = c('incubation','chick-rearing'),
+                   behaviour = c('Foraging'),
+                   tod = c('day','night'),
+                   sunLoc = c(-52.7988, 48.1165),    # defaults to Baccalieu
+                   source = here::here('output_data/ltm_bart_birds'),
+                   destination = od
+  )
+})
+
+```
+
+Extract mean densities by production area. 
+
+```{r extract-oil-risk}
+
+out <- extract_dens(source = od, extract_areas = ogl, modlab = 'Breeding')
+
+out <- rbind(out) |> 
+  dplyr::group_by(ProdArea,area_km2,Province,license_type,colony,month) |> 
+  dplyr::summarise(
+    med = sum(med),
+    ll = sum(ll),
+    ul = sum(ul)
+  )
+
+month_sum <- out |> 
+  dplyr::group_by(Province, ProdArea, month, license_type) |> 
+  dplyr::summarise(
+    dens_med = sum(med),
+    dens_ll = sum(ll),
+    dens_ul = sum(ul)
+  )
+
+oil_buff <- 200
+out_bs <- out |> 
+  dplyr::mutate(
+    med = med * oil_buff,
+    ll = ll * oil_buff,
+    ul = ul * oil_buff,
+  )
+
+month_sum_bs <- out_bs |> 
+  dplyr::group_by(Province, ProdArea, month, license_type) |> 
+  dplyr::summarise(
+    dens_med = sum(med),
+    dens_ll = sum(ll),
+    dens_ul = sum(ul)
+  )
+
+month_sum_bs |> 
+  dplyr::mutate(
+    value = paste0(round(dens_med,1), ' (', round(dens_ll,1), '-', round(dens_ul, 1), ')')
+  ) |> 
+  dplyr::select(-dens_med, -dens_ll, -dens_ul) |> 
+  tidyr::pivot_wider(names_from = month, values_from = value) |> 
+  dplyr::arrange(desc(ProdArea), license_type, Province) |> 
+  dplyr::rename(Area = ProdArea, `License type`= license_type) |> 
+  dplyr::select(`License type`, Province, Area, June, July, August,September) |> 
+  write.csv(here::here('plots_man/oil_risk_summary.csv'),row.names = F)
+
+```
+
+
+### Summarize model performance
+
+Calculate AUC for the withheld validation data.
+
+```{r val-witheld}
+
+options(java.parameters = "-Xmx20g")
+library(bartMachine)
+
+val_dat <- readRDS(here::here("input_data/LHSP_validation_data.RDS")) |> 
+  sf::st_drop_geometry() |> 
+  na.omit()
+mod <- readRDS(here::here('output_data/bart_model_full.RDS'))
+pred <- predict(mod, new_data = val_dat[,names(mod$X)])
+val_dat$pred_dyn <- pred
+
+val_sum <- val_dat |> 
+  dplyr::group_by(colony) |> 
+  dplyr::summarise(
+    WH_AUC = pROC::auc(pROC::roc(obs, pred_dyn))[[1]],
+  ) |> 
+  dplyr::mutate(
+    colony = factor(colony, levels = colord)
+  ) |> 
+  dplyr::arrange(colony)
+
+val_sum <- rbind(
+  val_sum,
+  data.frame(colony = 'All', WH_AUC = mean(val_sum$WH_AUC))
+)
+
+```
+
+Summarize AUC for the LOOCV by colony.
+
+```{r val-loocv}
+tg <- readRDS(here::here('output_data/bart_tune_grid.RDS')) |> 
+  dplyr::filter(k == 2, num_trees == 200) |> 
+  dplyr::mutate(
+    colony = factor(colony, levels = colord)
+  ) 
+
+cv_sum <- tg |> 
+  dplyr::group_by(colony) |> 
+  dplyr::summarize(
+    CV_AUC = mean(auc),
+    SD = sd(auc)
+  )
+
+cv_sum <- rbind(
+  cv_sum,
+  data.frame(colony = 'All', CV_AUC = mean(cv_sum$CV_AUC), SD = NA)
+)
+
+out <- cv_sum |> 
+  dplyr::select(colony, CV_AUC) |> 
+  dplyr::inner_join(val_sum) |> 
+  dplyr::mutate(
+    CV_AUC = round(CV_AUC, 3),
+    WH_AUC = round(WH_AUC, 3)
+  )
+
+```
+
+
+```{r val-table-s5-auc}
+
+write.csv(out, here::here('plots_man/AUC_table.csv'), row.names = F)
+
+```
+
+Calculate Continuous Boyce Index for validation data
+
+```{r}
+
+options(java.parameters = "-Xmx20g")
+library(bartMachine)
+
+val_dat <- readRDS(here::here("input_data/LHSP_validation_data.RDS")) |> 
+  sf::st_drop_geometry() |> 
+  na.omit()
+mod <- readRDS(here::here('output_data/bart_model_full.RDS'))
+pred <- predict(mod, new_data = val_dat[,names(mod$X)])
+val_dat$pred_dyn <- pred
+
+```
+
+```{r}
+
+cbi_out <- vector('list', length(unique(val_dat$colony)))
+names(cbi_out) <- unique(val_dat$colony)
+
+for (cn in unique(val_dat$colony)) {
+  fn <- list.files(here::here(paste('output_data/ltm_bart_pred/'), cn), full.names = T, recursive = T)
+  
+  out <- lapply(fn, function(f) {
+    r <- terra::rast(f)
+    r <- terra::quantile(r, 0.5)
+    v <- strsplit(sub('.tif','',basename(f)), split = '_')[[1]]
+    data.frame(terra::values(r, na.rm = T), 
+               colony = v[1],
+               month = v[2],
+               status = v[3],
+               behaviour = v[4],
+               tod = v[5]
+    )
+  })
+  
+  out <- do.call(rbind, out)
+  
+  cbi_out[[cn]] <- ecospat::ecospat.boyce(fit = out$q0.5, 
+                                          obs = val_dat$pred_dyn[val_dat$obs == 1], 
+                                          nclass=0,
+                                          window.w = 1/20,
+                                          PEplot = FALSE, 
+                                          rm.duplicate = TRUE, 
+                                          method = 'spearman')
+  print(paste('Finished:', cn))
+  
+}
+
+
+```
+
+```{r}
+
+cbi_vals <- data.frame()
+cbi_sum <- data.frame()
+
+for (cn in names(cbi_out)) {
+  idx <- 1
+  while(cbi_out[[cn]]$F.ratio[idx + 1] < 1 & idx < 101) idx <- idx+1
+  cbi_sum <- rbind(cbi_sum, 
+                   data.frame(
+                     colony = cn,
+                     cbi = cbi_out[[cn]]$cor,
+                     thresh = cbi_out[[cn]]$HS[idx]
+                   ))
+  cbi_vals <- rbind(cbi_vals, 
+                    data.frame(
+                      colony = cn,
+                      F.ratio = cbi_out[[cn]]$F.ratio,
+                      HS = cbi_out[[cn]]$HS
+                    ))
+  
+}
+
+ggplot(cbi_vals) +
+  geom_line(aes(x = HS, y = F.ratio, col = colony)) 
+
+cbi_sum
+cbi_sum$colony <- factor(cbi_sum$colony, levels = c('Baccalieu','Gull','Middle Lawn','Country','Bon Portage','Kent'))
+cbi_sum <- cbi_sum[as.numeric(cbi_sum$colony),]  
+cbi_sum <- rbind(cbi_sum, 
+                 data.frame(colony = 'All',cbi = mean(cbi_sum$cbi), thresh = mean(cbi_sum$thresh))
+)
+cbi_sum
+
+#write.csv(cbi_sum[,c('colony', 'cbi')], here::here('plots_man/CBI_table.csv'), row.names = F)
+
+```

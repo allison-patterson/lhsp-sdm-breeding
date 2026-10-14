@@ -1,0 +1,260 @@
+---
+title: "Prepare oil and gas risk layers"
+author: "Katharine Studholme"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+---
+
+```{r setup, include=FALSE}
+
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
+
+# Load functions
+source(here::here("R/functions.R"), echo = F)
+
+# projection
+mp <- '+proj=aea +lon_0=-60 +lat_1=30 +lat_2=60 +lat_0=45 +datum=WGS84 +units=m +no_defs'
+
+```
+
+This script loads all available oil and gas license area polygons from Newfoundland and Nova Scotia and generates a single shapefile representing all current activity. It also generates a shapefile of all license area polygons included in our risk exposure case studies - production and exploration license areas only.
+
+# Load and project available NL and NS OPB data
+
+## Newfoundland
+
+### Call for Bids
+
+Most recent call for bids, 2026
+
+```{r CFB-NL}
+
+cfbNL <- sf::st_read(here::here("raw_data/threats/nl_petroleum/Active_CFB/Active_CFB.shp")) |>
+  sf::st_zm(drop = T) |>
+  sf::st_transform(sf::st_crs(mp)) |>
+  dplyr::mutate(Activity = "Call for Bids",
+                Province = "NL",
+                Year = 2026,
+                ID = Parcel) |>
+  dplyr::select(Province, Activity, ID, LTR, Year)
+
+```
+
+### Active Licenses
+
+Include active exploration licenses, significant discovery licenses, and production licenses in one object.
+
+```{r nl-licenses}
+
+# NL EL, has Z coords
+exNL <- sf::st_read(here::here("raw_data/threats/nl_petroleum/Active-EL/Active-EL.shp")) |>
+  sf::st_zm(drop = T) |>
+  sf::st_transform(sf::st_crs(mp)) |>
+  dplyr::mutate(Activity = "Exploration",
+                Province = "NL",
+                ID = gsub(" ", "_", Licence)) |>
+  dplyr::select(Province, Activity, ID, Effective, Period1Exp, Period2Exp, LTR)
+
+# NL SDL
+sdNL <- sf::st_read(here::here("raw_data/threats/nl_petroleum/Active-SDL/Active-SDL.shp")) |>
+  sf::st_zm(drop = T) |>
+  sf::st_transform(sf::st_crs(mp)) |>
+  dplyr::mutate(Activity = "Significant Discovery",
+                Province = "NL",
+                ID = gsub(" ", "_", Licence)) |>
+  dplyr::select(Province, Activity, ID, Effective, LTR)
+
+# NL PDL
+pdNL <- sf::st_read(here::here("raw_data/threats/nl_petroleum/Active-PL/Active-PL.shp")) |>
+  sf::st_zm(drop = T) |>
+  sf::st_transform(sf::st_crs(mp))|>
+  dplyr::mutate(Activity = "Production",
+                Province = "NL",
+                ID = gsub(" ", "_", Licence),
+                AreaName = ComDisArea) |>
+  dplyr::select(Province, Activity, ID, Effective, LTR, AreaName)
+
+```
+
+
+## Nova Scotia 
+
+### Call for Bids
+
+New CFB for Nova Scotia, July 2025. Parcels 8 & 9 successful bids but need federal and provincial ministerial review and approval to become active ELs.
+
+```{r CFB-NS}
+
+cfbNS <- sf::st_read(here::here("raw_data/threats/ns_petroleum/PR-CFB-NS25-1P-Parcels/PR-CFB NS25-1P Parcels.shp")) |>
+  sf::st_transform(sf::st_crs(mp)) |>
+  dplyr::mutate(Parcel_Num = sprintf("%02d", as.numeric(Parcel_Num)),
+                ID = paste0("PR-CFB-NS25-1P-", Parcel_Num),
+                Activity = "Call for Bids",
+                Year = 2025,
+                Province = "NS") |>
+  dplyr::select(Province, Activity, ID, Year)
+
+```
+
+### Active Licenses
+
+Include active exploration licenses, significant discovery licenses, and production licenses in one object.
+
+```{r ns-licenses}
+
+## NS Significant Discovery, excel NAD27. 
+## File dated 2022.
+sdNS <- readxl::read_excel(here::here("raw_data/threats/ns_petroleum/significant_discovery_licenses_sept_2022.xls"),
+                     range = "A3:L251",
+                     col_names = c("lat", "lon", "lat.d", "lat.m", "lat.s", "lon.d", "lon.m", "lon.s", "licence.type", "licence.number", "field.name", "part")) |>
+    dplyr::mutate(polyID = ifelse(is.na(part), licence.number, paste0(licence.number, "_", part))) |>
+  sfheaders::sf_polygon(x = "lon",
+                        y = "lat",
+                        polygon_id = "polyID",
+                        keep = TRUE) |>
+  sf::st_set_crs(4267) |>
+  sf::st_transform(sf::st_crs(mp)) |>
+  dplyr::mutate(ID = paste0(licence.type, "_", licence.number),
+              Activity = "Significant Discovery",
+              Province = "NS",
+              AreaName = field.name) |>
+  dplyr::select(Province, Activity, ID, AreaName)
+
+# NS production, excel, NAD27
+pdNS <- readxl::read_excel(here::here("raw_data/threats/ns_petroleum/production_licenses_july_2024.xlsx"),
+                           range = "A3:L60",
+                           col_names = c("lat", "lon", "lat.d", "lat.m", "lat.s", "lon.d", "lon.m", "lon.s", "licence.type", "licence.number", "field.name", "part")) |>
+  sfheaders::sf_polygon(x = "lon",
+                        y = "lat",
+                        polygon_id = "licence.number",
+                        keep = TRUE) |>
+  sf::st_set_crs(4267) |>
+  sf::st_transform(sf::st_crs(mp)) |>
+  dplyr::mutate(ID = paste(licence.type, licence.number),
+              Activity = "Production",
+              Province = "NS",
+              AreaName = field.name) |>
+  dplyr::select(Province, Activity, ID, AreaName)
+
+```
+
+
+# Check for updates to 'Active' licenses based on cnloer and cnsoer website search
+
+Last checked in 2026.
+
+## Newfoundland
+
+Simple update by downloading and integrating new shapefiles from cnloer).
+
+## Nova Scotia
+
+More manual checking required.
+
+https://cnsoer.ca/oil-gas-energy/current-activity
+"There is no current petroleum-related activity happening in the Canada-Nova Scotia offshore area." 
+
+BUT https://cnsoer.ca/oil-gas-energy/lands-management/maps-and-coordinates
+Query tool has n=7 PLs, expiry dates for all still in the future (2028 earliest)
+Query tool has n=32 SDLs, expiry dates that I checked are 'indefinite'. 30 SDLs in our dataset (40 with the sub parts). All updated with company name change in 2020.
+Query has ELs, but we know none are active at this time based on https://cdn.cnsoer.ca/sites/default/files/2025-01/EL-none.pdf, posted January 2022.
+
+AND 'interest summary table 16 July 2024' (https://cdn.cnsoer.ca/sites/default/files/2025-01/Interest_summary_table_26_july_2024.pdf) indicates the 7 PLs, plus 32 SDLs (see code below). So, PLs ok, but our shapefile dataset has two fewer SDLs than the 'interest summary table': missing 2255A and 2277A. Nothing can be done at this time. Ultimately, may need to request these two polygons?
+
+```{r update_lic_ns, include = F, eval = F}
+
+webSD <- c("2120A", "2120B", "2120C", "2121", "2254", "2255A", "2255B", "2255C", "2255D", "2255E", "2255F", "2255G", "2255L", "2255M", "2255N", "2255P", "2255Q", "2255R", "2259", "2269", "2276A", "2276B", "2276C", "2277A", "2277B", "2283A", "2283B", "2283C", "2286", "2298", "2299A", "2702")
+
+webSD[!(webSD %in% gsub("SDL_", "", sdNS$ID))]
+
+```
+
+# Join all license areas
+
+```{r join-lic}
+
+lic <- dplyr::bind_rows(cfbNL, exNL, sdNL, pdNL, cfbNS, sdNS, pdNS) |>
+  dplyr::mutate(Activity = factor(Activity, ordered = T, levels = c("Call for Bids", "Exploration", "Significant Discovery", "Production"))) |>
+  dplyr::select("Province", "Activity", "ID", "LTR", "AreaName", "Year", "Effective", "Period1Exp", "Period2Exp")
+
+saveRDS(lic, here::here("raw_data/threats/threats_offshorePetro_licensePolygons.rds"))
+
+mapview::mapview(lic, zcol = "Activity")
+
+```
+
+## Create_OGL_polygons
+
+Prepare polygons representing production and exploration license areas to use in our case studies comparing the number of breeding birds exposed to ALAN and number or breeding birds exposed to oil
+
+```{r}
+### Load original license polygons
+petex <- readRDS(here::here('raw_data/threats/threats_offshorePetro_licensePolygons.rds'))
+table(petex$Activity)
+
+petex |> 
+  dplyr::filter(Activity == 'Production') |> 
+  dplyr::group_by(AreaName) |> 
+  dplyr::summarize(
+    n = dplyr::n()
+  )
+
+# Summarize production areas ----------------------------------------------
+
+pa <- petex |> 
+  dplyr::filter(Activity == 'Production') |> 
+  sf::st_transform(mp) |> 
+  dplyr::mutate(
+    ProdArea = dplyr::case_when(
+      AreaName %in% c('North Amethyst', 'White Rose') ~ 'Sea Rose',
+      AreaName %in% c('Hebron Asset') ~ 'Hebron',
+      AreaName %in% c('Deep Panuke', 'Cohasset (deep)', 'Cohasset') ~ 'Panuke',
+      TRUE ~ AreaName,
+    ),
+    ProdArea = factor(ProdArea, 
+                      levels = c('Alma','Panuke','South Venture','Terra Nova','Hebron','Hibernia','Sea Rose')),
+    license_type = 'Production'
+  ) |> 
+  dplyr::group_by(Province, ProdArea, license_type) |> 
+  dplyr::summarize(
+    geometry = sf::st_union(geometry), # or SHAPE in case of data loaded from GDB
+    .groups = "drop"
+  ) |> 
+  sf::st_cast('POLYGON') 
+pa$area_km2 = as.numeric(sf::st_area(pa))/1000000
+
+# Summarize exploration areas ----------------------------------------------
+
+exa <- petex |> 
+  dplyr::filter(Activity == 'Exploration') |> 
+  sf::st_transform(mp) 
+exa$ProdArea <- paste0(exa$LTR, '_', substr(exa$ID, 4, 7))
+
+exa <- exa |> 
+  dplyr::mutate(
+    ProdArea = factor(ProdArea, levels = c("WNL_1070","EN_1173","EN_1172",
+                                         "EN_1171","EN_1169","EN_1166","EN_1170")),
+    license_type = 'Exploration'
+  ) |> 
+  dplyr::group_by(Province,ProdArea, license_type) |> 
+  dplyr::summarize(
+    geometry = sf::st_union(geometry), # or SHAPE in case of data loaded from GDB
+    .groups = "drop"
+  ) |> 
+  sf::st_cast('POLYGON') 
+exa$area_km2 = as.numeric(sf::st_area(exa))/1000000
+
+# Combine areas ----------------------------------------------
+
+ogl <- rbind(exa, pa)
+ogl$license_type <- factor(ogl$license_type, levels = c('Exploration','Production'))
+mapview::mapview(ogl, zcol = 'license_type')
+
+saveRDS(ogl, here::here('raw_data/threats/OGL_polygons.rds'))
+
+
+```
+

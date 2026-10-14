@@ -1,0 +1,180 @@
+---
+title: "nBirds"
+author: "Allison Patterson"
+date: "`r Sys.Date()`"
+output: html_document
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+---
+
+```{r setup, include=FALSE}
+
+source(here::here("R/functions.R"), echo = F)
+library(doParallel)
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+### Load Phenology
+
+This table provides the number of birds from each colony that the non-breeding model should be applied to for every combination of month, behaviour, and time of day. It is based on proportion of birds within each region expected to be in each breeding stage by month. For incubation, only half of the birds are predicted to be at-sea because one member of the pair is assumed to be in the burrow. Remaining birds are assigned to behaviours for each time of day based on the stationary state probabilities in the HMM.
+
+```{r phenology}
+
+ph <- readRDS(here::here("input_data/nBirds_atSea.rds"))
+
+ph <- ph |> 
+  dplyr::filter(
+    month %in% c('June', 'July', 'August', 'September')
+  ) |> 
+  dplyr::mutate(
+    region = ifelse(region == 'Newfoundland', 'NL', 'SS')
+  )
+
+val_dat <- readRDS(here::here("input_data/LHSP_validation_data.RDS"))
+val_dat <- sf::st_drop_geometry(val_dat)
+val_dat <- na.omit(val_dat)
+
+```
+
+### Set habitat threshold
+
+Define a threshold for minimum suitable habitat. Any pixel with lower probability of use will be excluded from calculation of densities.The suitable habitat threshold is based on the probability that includes 90% of observed locations in the LOOCV data. 
+
+```{r}
+
+fn <- list.files(here::here('output_data/hypertuning'), pattern = '200_2', full.names = T)
+
+out <- lapply(fn, FUN = function(x) {
+  tt <- readRDS(x)
+  tt$colony <- strsplit(basename(x), '_')[[1]][1]
+  tt$region <- ifelse(tt$colony[1] %in% c('Kent', 'Bon Portage', 'Country'), 'SS', 'NL')
+  tt$iter <- sub('.RDS','',strsplit(basename(x), '_')[[1]][4])
+  tt
+})
+
+out <- do.call(rbind, out)
+head(out)
+
+tt <- expand.grid(
+  region =unique(ph$region),
+  iter = 1:5,
+  q90 = NA
+)
+
+for (i in 1:nrow(tt)) {
+  temp <- out |> 
+    dplyr::filter(region == tt$region[i], iter == tt$iter[i])
+  tt$q90[i] <- quantile(temp$pred[temp$obs == 'presence'], 0.1)
+}
+
+ggplot(tt, aes(x = region, y = q90)) +
+  geom_boxplot()
+
+reg_thresh <- tt |> 
+  dplyr::group_by(region) |> 
+  dplyr::summarise(
+    q90 = mean(q90)
+  )
+
+reg_thresh
+
+```
+
+### Calculate bird number rasters
+
+Sections below convert probability rasters into rasters with the number of birds per pixel. This process involves:
+
+- Projecting rasters to an equal area projection with a defined spatial resolution of 10x10 km
+- Masking out regions with probability of use < minimum habitat threshold
+- Converting to relative probability of use
+- Multiplying by the number of birds from the colony expected to be at-sea for that combination of month, behaviour, and time of day.
+
+```{r }
+
+cl <- parallel::makeCluster(16)
+doParallel::registerDoParallel(cl)
+
+foreach (cn = unique(ph$colony)) %dopar% {
+  fn <- list.files(here::here('output_data/ltm_bart_pred'), 
+                   pattern = paste0(cn,'_'), full.names = T, recursive = T)
+  out_dir <- here::here(paste0('output_data/ltm_bart_birds/',cn))
+  if (dir.exists(out_dir) == FALSE) dir.create(out_dir, recursive = T)
+  reg <- ph$region[ph$colony == cn][1]
+  min_prob <- reg_thresh$q90[reg_thresh$region == reg]
+  
+  for (f in fn) {
+    of <- paste0(out_dir,'/', basename(f))
+    if (file.exists(of) == FALSE) {
+      r <- terra::project(terra::rast(f), mp, res = 10000, method = 'bilinear')/254
+      r <- terra::ifel(r < min_prob, 0, r) 
+      if (max(terra::values(r[[1]]), na.rm = T) > 1) stop('Max raster value exceeds 1')
+      
+      pp <- strsplit(sub('.tif','',basename(f)), split = '_')[[1]]
+      s <- pp[3]
+      b <- pp[4]
+      d <- pp[5]
+      m <- month.name[which(month.abb == pp[2])]
+      i <- which(ph$colony == cn & ph$tod == d & ph$month == m
+                 & ph$behavior == tolower(b) & ph$status == s)
+      pop <- ph$nAtSea[i]
+      
+      v <- as.vector(terra::global(r, sum, na.rm = T))$sum
+      r <- r/v * pop
+      
+      terra::writeRaster(r, paste0(out_dir,'/', basename(f)), 
+                         overwrite=TRUE, 
+                         gdal=c("of=COG", 
+                                "COPY_SRC_OVERVIEWS=YES", 
+                                "COMPRESS=DEFLATE"), 
+                         datatype='INT4U',
+                         filetype='COG',
+                         scale = 1/10000
+      )
+      print(paste('saving:', of))
+      rm(r)
+      gc()
+      
+    } else print(paste('Skipping:', of))
+  }
+}
+parallel::stopCluster(cl)
+gc()
+
+```
+
+This generates summary rasters with the median density of birds.
+
+```{r}
+
+cl <- parallel::makeCluster(4)
+doParallel::registerDoParallel(cl)
+
+foreach (cn = unique(ph$colony)) %dopar% {
+  fn <- list.files(here::here('output_data/ltm_bart_birds'), 
+                   pattern = cn, full.names = T, recursive = T)
+  out_dir <- here::here(paste0('output_data/ltm_bart_birds_sum/',cn))
+  if (dir.exists(out_dir) == FALSE) dir.create(out_dir, recursive = T)
+  
+  for (f in fn) {
+    
+    of <- paste0(out_dir,'/', basename(f))
+    if (file.exists(of) == FALSE) {
+      r <- terra::rast(f)
+      q <- terra::quantile(r, 0.5, na.rm = T)
+      q <- q/terra::cellSize(q, unit = 'km')
+      
+      terra::writeRaster(q, paste0(out_dir,'/', basename(f)), 
+                         overwrite=TRUE
+      )
+      print(paste('saving:', of))
+    } else print(paste('Skipping:', of))
+    
+  }
+  
+}
+parallel::stopCluster(cl)
+gc()
+
+```
+

@@ -1,0 +1,405 @@
+---
+title: "get_envir_layers"
+author: "Allison Patterson"
+date: "`r Sys.Date()`"
+output: html_document
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+---
+
+In this script we generate competition layers, download environmental predictor data sets, and extract all static and dynamic predictor values for our observed and pseudo-locations data. Distributions of available vs observed environment are plotted for comparison. Lastly, we save test and validation datasets separately.
+
+```{r setup, include=FALSE}
+
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
+library(stars)
+library(lwgeom)
+source(here::here("R/functions.R"), echo = F)
+
+```
+
+### Read in location data
+
+Read in colony and location data to determine spatial and temporal extents for downloading environmental data.
+
+```{r read-locs}
+
+colonies <- readRDS(paste0(envir,'/colonies.RDS'))
+colonies <- sf::st_as_sf(colonies, coords = c('collon','collat'), crs = 4326)
+
+dat <- readRDS(here::here('input_data/LHSP_locs_plus_PA.RDS'))
+dat$date <- as.Date(dat$time)
+
+r <- terra::rast(paste0(envir,'/bathymetry.nc'))
+my_ext <- terra::ext(r)
+
+```
+
+### Competition layer
+
+This section creates a raster representing the potential intraspecific competition from conspecifics at all colonies in the region. First it calculates the cumulative null density of birds with increasing distance from each colony. Cells are ordered by increasing distance from the colony and the cumulative sum of ocean area is calculated for each cell, an index of within-colony competition (intracolony) is calculated as the colony population divided by the cumulative ocean area available at that distance. Values from all these layers are summed to create a single competition layer representing the regional population. Values are on the log scale. There is also an intercolony competition layer created representing the number of birds from other colonies excluding each focal colony, this is not currently used in the model.
+
+```{r competition}
+
+# custom function to generate intercolony and intracolony competition rasters
+calc_competition_rast(colonies = colonies, 
+                      colonydist = paste0(envir,'/colonydist'), 
+                      destination = envir,
+                      logvalues = TRUE, 
+                      res = envir_res, 
+                      focalNA = FALSE) 
+
+r <- terra::rast(paste0(envir,'/competition.nc'))
+terra::plot(r)
+
+```
+
+### Get Copernicus Marine Store data
+
+Daily oceanographic data are obtained from the CMS physical and biological oceanographic models:
+- SST (thetao)
+- salinity (so)
+- sea surface height (zos)
+- average sea surface height (mdt)
+- mixed layer depth (mlotst)
+- northward current velocity (uo)
+- westward current velocity (vo)
+- net primary productivity (nppv)
+- chloropyhll a (chl)
+
+```{r cms}
+
+# Daily varying predictors for physical oceanography
+for (v in c('thetao', 'so', 'zos', 'mlotst','uo','vo')) {
+  
+  PelagicMagic::get_cms_data(
+    my_env = cm_env,
+    out_dir = paste0(envir, '/cms'),
+    var = v,
+    prod = "cmems_mod_glo_phy_hindcast",
+    freq = c("daily"),
+    region = my_ext,
+    date_min = as.Date(min(dat$time)),
+    date_max = as.Date(max(dat$time)),
+    depth_min = 0,
+    depth_max = 0,
+    overwrite = FALSE
+  )
+  
+}
+
+# Static predictors
+PelagicMagic::get_cms_data(
+  my_env = cm_env,
+  out_dir = paste0(envir, '/cms'),
+  var = 'mdt',
+  prod = "cmems_mod_glo_phy_hindcast",
+  freq = c("static"),
+  region = my_ext,
+  date_min = as.Date(min(dat$time)),
+  date_max = as.Date(max(dat$time)),
+  depth_min = 0,
+  depth_max = 0,
+  overwrite = FALSE
+)
+
+# Daily varying predictors for productivity 
+for (v in c('nppv', 'chl')) {
+  
+  PelagicMagic::get_cms_data(
+    my_env = cm_env,
+    out_dir = paste0(envir, '/cms'),
+    var = v,
+    prod = "cmems_mod_glo_bgc_hindcast",
+    freq = c("daily"),
+    region = my_ext,
+    date_min = as.Date(min(dat$time)),
+    date_max = as.Date(max(dat$time)),
+    depth_min = 0,
+    depth_max = 0,
+    overwrite = FALSE
+  )
+  
+}
+
+r <- terra::rast(list.files(paste0(envir, '/cms/daily/nppv'), full.names = T))
+terra::plot(r[[1]])
+
+```
+Get prey variables from the low and mid-trophic level prey model.
+
+This code is a bit more complicated to download and rename each year separately, then remove NA values that were causing issues with some versions of terra.
+
+```{r cms-ltml}
+
+# Daily varying predictors for prey
+
+for (v in c('zooc','mnkc_epi','mnkc_hmlmeso','mnkc_mumeso')) {
+  for (y in sort(unique(strftime(dat$time, '%Y')))) {
+    fn <- list.files(paste0(envir, '/cms/daily/',v), full.names = T)
+    if (length(grep(y, fn)) == 0) {
+      
+      PelagicMagic::get_cms_data(
+        my_env = cm_env,
+        out_dir = paste0(envir, '/cms'),
+        var = v,
+        prod = "cmems_mod_glo_ltml_hindcast",
+        freq = c("daily"),
+        region = my_ext,
+        date_min = as.Date(paste0(y, '-01-01')), #as.Date(min(dat$timestamp)),
+        date_max = as.Date(paste0(y, '-12-31')),#as.Date(max(dat$timestamp)),
+        depth_min = 0,
+        depth_max = 1,
+        overwrite = FALSE
+      )
+      fn <- list.files(paste0(envir, '/cms/daily/',v), full.names = T, pattern = paste0(v, '.nc'))
+      nn <- sub('.nc', paste0('-',y, '.nc'), fn)
+      file.rename(fn, nn)
+      
+      r <- terra::rast(nn)
+      rn <- terra::ifel(is.na(r), NA, r)
+      terra::units(rn) <- terra::units(r)
+      terra::varnames(rn)<- terra::varnames(r)
+      terra::longnames(rn) <- terra::longnames(r)
+      terra::time(rn) <- terra::time(r)
+      r <- terra::rast()
+      terra::writeCDF(rn, nn, unit = terra::units(rn), 
+                      varname = terra::varnames(rn), 
+                      longname = terra::longnames(rn),
+                      missval = NA,
+                      overwrite = T)
+      
+      
+      print(paste('Finished:', v, y))
+    }
+  }
+}
+
+r <- terra::rast(list.files(paste0(envir, '/cms/daily/zooc'), full.names = T))
+terra::plot(r[[1]])
+
+```
+
+### Calculate SST gradient
+
+We derive the gradient in SST.
+
+```{r sstsd}
+dd <- sort(unique(as.Date(dat$time)))
+fn <- list.files(paste0(envir, '/cms/daily/thetao'), full.names = T)
+
+calc_gradient_rast(layers =  fn,
+                   dates = dd, 
+                   destination = paste0(envir, '/cms/daily/sstsd'), 
+                   newlabel = 'sstsd', 
+                   w = 3, 
+                   fun = 'sd', 
+                   na.rm = T)
+
+fn <- list.files(paste0(envir, '/cms/daily/sstsd'), full.names = T)
+r <- terra::rast(fn[1])
+terra::plot(r, main = sub('.nc','',basename(fn[10])))
+
+```
+
+### Calculate SSH gradient
+
+Derive the gradient in SSH.
+
+```{r sshsd}
+
+fn <- list.files(paste0(envir, '/cms/daily/zos'), full.names = T)
+calc_gradient_rast(layers = fn, 
+                   dates = dd, 
+                   destination = paste0(envir, '/cms/daily/sshsd'), 
+                   newlabel = 'sshsd', 
+                   w = 3, 
+                   fun = 'sd', 
+                   na.rm = T)
+
+fn <- list.files(paste0(envir, '/cms/daily/sshsd'), full.names = T)
+r <- terra::rast(fn[1])
+terra::plot(r, main = sub('.nc','',basename(fn[1])))
+
+```
+
+### Calculate current gradient
+
+Derive current velocity and the current velocity.
+
+```{r}
+
+if (dir.exists(paste0(envir, '/cms/daily/current')) == FALSE) dir.create(paste0(envir, '/cms/daily/current'))
+
+if (file.exists(paste0(envir, '/cms/daily/current/current.nc')) == FALSE) {
+  uo <- terra::rast(list.files(paste0(envir, '/cms/daily/uo'), full.names = T))
+  vo <- terra::rast(list.files(paste0(envir, '/cms/daily/vo'), full.names = T))
+  cv <- sqrt(uo^2 + vo^2)
+  terra::writeCDF(cv, paste0(envir, '/cms/daily/current/current.nc'), longname="Current velocity (m/s)", varname='current velocity',unit = 'm/s')
+}
+
+dd <- sort(unique(as.Date(dat$time)))
+
+fn <- paste0(envir, '/cms/daily/current/current.nc')
+calc_gradient_rast(layers = fn, 
+                   dates = dd, 
+                   destination = paste0(envir, '/cms/daily/currsd'), 
+                   newlabel = 'currsd', 
+                   w = 3, 
+                   fun = 'sd', 
+                   na.rm = T)
+
+fn <- list.files(paste0(envir, '/cms/daily/currsd'), full.names = T)
+r <- terra::rast(fn[1])
+terra::plot(r)
+
+```
+
+### Calculate sea surface height anomaly
+
+Calculate sea surface height anomaly.
+
+```{r ssha}
+
+if (dir.exists(paste0(envir, '/cms/daily/ssha')) == FALSE) dir.create(paste0(envir, '/cms/daily/ssha'))
+
+if (file.exists(paste0(envir, '/cms/daily/ssha/ssha.nc')) == FALSE) {
+  ssh <- terra::rast(list.files(paste0(envir, '/cms/daily/zos'), full.names = T))
+  mdt <- terra::rast(list.files(paste0(envir, '/cms/static/mdt'), full.names = T))
+  ssha <- ssh - mdt
+  terra::writeCDF(ssha, paste0(envir, '/cms/daily/ssha/ssha.nc'), longname="Sea surface height anomaly (m)", varname='ssha',unit = 'm')
+}
+
+fn <- list.files(paste0(envir, '/cms/daily/ssha'), full.names = T)
+r <- terra::rast(fn[1])
+terra::plot(r[[1]])
+
+```
+
+### Combine dynamic variables into consistent rasters for extraction
+
+For each date in the dataset, we combined all dynamic environmental variables into a single raster
+using the grid from the bathymetric data. Each raster is resampled to the same grid and NAs are filled in 
+using terra::focal() with a width of 5 cells. This speeds up and standardizes envrionmental data extraction.
+
+```{r}
+
+od <- paste0(paste0(envir, '/daily_extraction'))
+id <- paste0(envir,'/cms/daily')
+
+br <- terra::rast(paste0(envir, '/bathymetry.nc'))
+vv <- c("chl","current","currsd","mlotst","mnkc_epi","mnkc_hmlmeso",
+             "mnkc_mumeso","nppv","so","ssha","sshsd","sstsd","thetao",  
+             "zooc","zos")
+
+dd <- sort(unique(dat$date))
+
+make_dyn_rasters(dates = dd, in_dir = id, out_dir = od, base_rast = br, vars = vv) 
+
+```
+
+Save static variables in a single raster.
+
+```{r save-stat-rast}
+
+if (file.exists(paste0(envir, '/static_rast.nc')) == FALSE) {
+  rn <- c(paste0(envir, '/bathymetry.nc'),
+          paste0(envir, '/slope.nc'),
+          paste0(envir, '/coastdist.nc'),
+          paste0(envir, '/shelfdist.nc'),
+          paste0(envir, '/competition.nc')
+  )
+  
+  static_rast <- terra::rast(rn)
+  names(static_rast)[names(static_rast) == 'log density'] <- 'competition'
+  
+  terra::writeCDF(static_rast, paste0(envir, '/static_rast.nc'), missval = NA, split=TRUE,
+                  overwrite = T)
+}
+
+```
+
+## Extract environmental predictors
+
+Extract environmental predictors associated with each location. Including:
+
+- log of population (logpop)
+- time of day (daynight)
+- bathymetery (elevation)
+- region (NL, SS)
+- slope
+- distance to coast (coastdist)
+- distance to shelf break (coastdist)
+- distance to colony (colonydist)
+- competition
+- sea surface temperature (thetao)
+- sea surface temperature gradient (sstsd)
+- mixed layer depth (mlotst)
+- salinity (so)
+- current speed (current)
+- current speed gradient (currentsd)
+- sea surface height anomaly (ssha)
+- sea surface high gradient (sshsd)
+- net primary productivity (nppv)
+- chlorophyll a (chl)
+- epipelagic micronekton (mnkc_epi)
+- migratory mesopelagic micronekton (mnkc_mumeso)
+- highly migratory mesopelagic micronekton (mnkc_hmlmeso)
+- zooplankton (zooc)
+
+```{r get-preds}
+
+sr <- terra::rast(paste0(envir, '/static_rast.nc'))
+cr <- terra::rast(list.files(paste0(envir, '/colonydist'), full.names = T))
+
+out <- get_preds(data = dat, 
+                 stat_rast = sr, 
+                 col_rast = cr, 
+                 dyn_dir = paste0(envir, '/daily_extraction'), 
+                 daynight = TRUE)
+
+```
+
+## Plot variables
+
+Examine the distribution of spatial variables for simulated and observed tracks. This is a rough look at which variables are broadly different, it does not consider more complex interactions among predictor variables.Plots are split out by time of day and behaviour to explore how habitat use my differ according to these factors.
+
+Plots for spatio-temporal variables by time of day and state:
+
+```{r plot-vars-2, echo = FALSE}
+
+for (v in c("elevation","slope","coastdist","shelfdist","competition","colonydist",  
+            "chl","current","currsd","mlotst","mnkc_epi","mnkc_hmlmeso","mnkc_mumeso", 
+            "nppv","so","ssha","sshsd","sstsd","thetao","zooc")) {
+  
+  p <- out |> 
+    data.frame() |> 
+    dplyr::select(obs, state, daynight, v) |> 
+    tidyr::pivot_longer(cols = dplyr::all_of(v)) |> 
+    ggplot(aes(x = value, col = factor(obs), fill = factor(obs))) +
+    geom_density(alpha = 0.5) +
+    facet_grid(rows = vars(state), cols = vars(daynight)) +
+    scale_fill_viridis_d(direction = -1) +
+    scale_color_viridis_d(direction = -1) +
+    labs(title = v,
+         subtitle = "Compare distribution of observed (purple) and available (yellow)")
+  
+  print(p)
+  
+}
+
+```
+
+
+## Split train and validation data
+
+Save the two data types (training and validation) separately to avoid accidentally using validation in model training.
+
+```{r split-data}
+
+saveRDS(out[out$group == 'Train',], here::here('input_data/LHSP_train_data.RDS'))
+
+saveRDS(out[out$group == 'Validation',], here::here('input_data/LHSP_validation_data.RDS'))
+
+```

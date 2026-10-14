@@ -1,0 +1,588 @@
+---
+title: "HMM modelling - Leach's Storm Petrel GPS data" 
+subtitle: "Variables with SDM compatibility. No interaction terms."
+author: "Katharine Studholme"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+output: html_document
+---
+
+```{r setup, include = F}
+
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
+source(here::here("R/functions.R"), echo = F)
+
+library(dplyr)
+library(lubridate)
+library(momentuHMM)
+
+if (dir.exists(here::here('output_data/hmm')) == FALSE) dir.create(here::here('output_data/hmm'))
+output_loc <- here::here("output_data/hmm")
+
+```
+
+Our goal is to incorporate key biological predictors (selected a priori) to classify LHSP GPS positions into three states (transit, extensive search, intensive search/rest) for use in a species distribution model (SDM) informing risk exposure at sea.
+
+In order to adjust the number of birds at sea according to state probabilities in the outputs of our SDM, we need to use variables that are consistent with those informing the SDM. This requires the use of region rather than colony so that results can be applied to untracked colonies by region. Similarly, our original consideration of standardized time of day is too complex and instead the SDM incorporates a simple night vs day variable. Incubation and chick rearing are included in the SDM as predictors.
+
+# Dataset for Hidden Markov Model (HMM) 
+
+The dataset we load here has positions within 10km of the colony removed, includes only classic, short and incomplete trips (leaving aside gappy trips), and has positions interpolated to 2hr intervals within each trip. 
+
+Note we have not addressed repeated measures (individuals have different numbers of trips/points and some tracked in multiple years).
+
+``` {r, include = T}
+
+# load data
+data_tripSplit_2h <- readRDS(here::here("input_data/data_tripSplit_2h.rds"))
+
+# Check class
+class(data_tripSplit_2h)
+
+colID <- c("Baccalieu", "Bon Portage", "Country", "Gull", "Kent", "Middle Lawn")
+regID <- c("Newfoundland", "Scotian Shelf")
+statusID <- c("incubation", "chick-rearing")
+
+HMMprep <- data_tripSplit_2h |>
+  filter(colonyBasic %in% colID) |>
+  filter(statusBasic %in% statusID) |>
+  ungroup() |>
+  droplevels() |>
+  mutate(colonyBasic = factor(ordered(colonyBasic, levels = c("Baccalieu", "Gull", "Middle Lawn", "Country", "Bon Portage", "Kent")), ordered = F),
+         statusBasic = factor(ordered(statusBasic, levels = c("incubation", "chick-rearing")), ordered = F),
+         region = as.factor(ifelse(colonyBasic %in% c("Baccalieu", "Gull", "Middle Lawn"), "Newfoundland", "Scotian Shelf")),
+         month = lubridate::month(datetime, label = TRUE),
+         doy = lubridate::yday(datetime),
+         step = step/1000) |>
+  droplevels()
+
+# Need to have no zero step lengths if using gamma distribution. Check here.
+sum(HMMprep$step == 0, na.rm = TRUE) 
+
+# Check that all covariates of interest do not have NAs!
+# test <- HMMprep |>
+#   dplyr::select(step, angle, colonyBasic, region, statusBasic, night_day_dd, night_day_sunAlt, month, doy) |>
+#   as.data.frame()
+# summary(test)
+
+```
+
+# Hidden Markov Model 
+Using the 'momentuHMM' package (@McClintock2018), and based on Auger-Méthé tutorial
+
+## Explore step and angle distributions
+
+For knowledge of behavioural difference between breeding stages AND to determine meaningful starting parameters for the HMM model
+
+Starting with all colonies pooled together:
+
+``` {r, include = T, echo = F}
+
+# Take a look at our values to help decide initial parameters
+
+step <- ggplot(HMMprep, aes(x = step)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, 
+                 fill = "grey", col = "white") +
+  scale_x_continuous(limits=c(0, 120), breaks = c(0, 30, 60, 90, 120)) +
+  labs(x = "step length (km)", y = "density") +
+  ggtitle("All colonies, all stages - Step length")
+
+angle <- ggplot(HMMprep, aes(x = angle)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, 
+                 fill = "grey", col = "white") +
+  labs(x = "angle (radians)", y = "density") +
+  ggtitle("All colonies, all stages - Turning angle")
+
+cowplot::plot_grid(step, angle, ncol = 2)
+
+```
+
+By colony:
+
+``` {r, include = T, echo = F}
+
+# Plot for all colonies
+step <- ggplot(HMMprep, aes(x = step)) +
+  facet_wrap("colonyBasic") +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, 
+                 fill = "grey", col = "white") +
+  labs(x = "step length (km)", y = "density")
+
+angle <- ggplot(HMMprep, aes(x = angle)) +
+  facet_wrap("colonyBasic") +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, 
+                 fill = "grey", col = "white") +
+  labs(x = "angle (radians)", y = "density")
+
+step
+angle
+
+```
+
+By region:
+
+``` {r, include = T, echo = F}
+
+# Plot for all colonies
+step <- ggplot(HMMprep, aes(x = step)) +
+  facet_wrap("region") +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, 
+                 fill = "grey", col = "white") +
+  labs(x = "step length (km)", y = "density")
+
+angle <- ggplot(HMMprep, aes(x = angle)) +
+  facet_wrap("region") +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, 
+                 fill = "grey", col = "white") +
+  labs(x = "angle (radians)", y = "density")
+
+step
+angle
+
+```
+
+By region and breeding stage:
+
+``` {r, include = T, echo = F}
+
+# Plot for all colonies
+# Drop where status is NA
+step <- ggplot(HMMprep[!is.na(HMMprep$statusBasic),], aes(x = step)) +
+  facet_grid(region ~ statusBasic) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, 
+                 fill = "grey", col = "white") +
+  labs(x = "step length (km)", y = "density")
+
+angle <- ggplot(HMMprep[!is.na(HMMprep$statusBasic),], aes(x = angle)) +
+  facet_grid(region ~ statusBasic) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, 
+                 fill = "grey", col = "white") +
+  labs(x = "angle (radians)", y = "density")
+
+step
+angle
+
+```
+
+Also, compare mean, median, and SD:
+
+``` {r, include = T, echo = F}
+
+step <- ggplot(aes(y = step,
+                 x = statusBasic),
+                 data = HMMprep[!is.na(HMMprep$statusBasic),]) +
+            geom_violin(draw_quantiles = c(0.25, 0.75),
+      linetype = "dashed") +
+            geom_violin(fill="transparent",draw_quantiles = 0.5) +
+            stat_summary(fun.y=mean, geom="point", shape=20, size=5, color="red", fill="red") +
+            facet_wrap("region") +
+            coord_flip() +
+            labs(y = "step length (km)")
+
+angle <- ggplot(aes(y = angle,
+                 x = statusBasic),
+                 data = HMMprep[!is.na(HMMprep$statusBasic),]) +
+            geom_violin(draw_quantiles = c(0.25, 0.75),
+      linetype = "dashed") +
+            geom_violin(fill="transparent",draw_quantiles = 0.5) +
+            stat_summary(fun.y=mean, geom="point", shape=20, size=5, color="red", fill="red") +
+            facet_wrap("region") +
+            coord_flip() +
+            labs(y = "angle (radians)")
+step
+angle
+
+```
+
+``` {r, include = T, echo = F}
+
+# Mean and SD values
+stepSum <- HMMprep |>
+  filter(!is.na(statusBasic)) |>
+  group_by(region, statusBasic) |>
+  dplyr::summarize(mean = mean(step, na.rm = T),
+                   median = median(step, na.rm = T),
+                   sd = sd(step, na.rm = T),
+                   q25 = quantile(step, 0.25, na.rm = T),
+                   q75 = quantile(step, 0.75, na.rm = T),
+                   nBird = length(unique(birdID)),
+                   nTrip = length(unique(ID)),
+                   nYr = length(unique(Year)))
+
+angleSum <- HMMprep |>
+  filter(!is.na(statusBasic)) |>
+  group_by(region, statusBasic) |>
+  dplyr::summarize(mean = mean(angle, na.rm = T),
+                   median = median(angle, na.rm = T),
+                   sd = sd(angle, na.rm = T),
+                   q25 = quantile(angle, 0.25, na.rm = T),
+                   q75 = quantile(angle, 0.75, na.rm = T),
+                   nBird = length(unique(birdID)),
+                   nTrip = length(unique(ID)),
+                   nYr = length(unique(Year)))
+
+```
+
+```{r, include = T, echo = F}
+
+stepSum |>  
+  kbl(align = "l", digits = 2, caption = "Step length summary by region and breeding stage", booktabs = T) |>
+  kable_styling(full_width = F, position = "left", latex_options = "scale_down")
+
+angleSum |>  
+  kbl(align = "l", digits = 2, caption = "Angle concentration summary by region and breeding stage", booktabs = T) |>
+  kable_styling(full_width = F, position = "left", latex_options = "scale_down")
+
+```
+
+##  Basic 3 state model
+
+We first tried both an initial 2 state and initial 3 state model (without covariates) to compare them. For each, we varied our parameter choices (mu, sigma, kappa) and confirmed no change in model results. 
+
+Model fit was  equivalent between the two and three state models. Three behavioural states makes the most biological sense for pelagic seabird foraging behaviour. The states identified logically fit with a pattern of transit, extensive search, and intensive search/resting (we cannot differentiate these with our 2hr interval positions). 
+
+We proceed with the 3 state model.
+
+``` {r 3-state model, include = F, echo = T}
+
+# Define initial values for the parameters
+mu04 <- c(5, 40, 75)
+sigma04 <- c(5, 40, 75)
+kappa04 <- c(0.1, 1, 1)
+
+stepPar <- c(mu04, sigma04) # no zero-inflation, so no zero-mass included
+anglePar <- kappa04
+formula = ~1
+
+HMMfit3s <- momentuHMM::fitHMM(data = HMMprep, 
+                               nbStates = 3, 
+                               dist = list(step = "gamma", angle = "vm"),
+                               Par0 = list(step = stepPar, angle = anglePar), 
+                               estAngleMean = NULL, 
+                               formula = ~1)
+
+HMMfit3s
+
+# Plot distributions by state and examine model fit
+plot(HMMfit3s, plotTracks = F, ask = F, plotCI = T)
+momentuHMM::plotPR(HMMfit3s)
+# Plots states and probability of state against observation number
+#momentuHMM::plotStates(HMMfit3s)
+
+saveRDS(HMMfit3s, paste0(output_loc, "/HMMfit3s_SDM.rds"))
+
+```
+
+## Covariates for the transition probabilities between states
+
+**Minimum Biologically Plausible Model:**
+
+**Time of day** affects likelihood to be in/switch to a given state given diel foraging behaviour (night/day).
+
+**Region** have different prey composition and foraging habitats at different distances from the colony. This is very likely to affect the probability of being in a given state.
+
+**Breeding status** puts different demands (time constraint, food type) on birds. This could affect the probability of being in a given state (e.g. more time foraging). We know foraging tends to occur closer to the colony during chick-rearing. 
+
+We anticipate interactions between these covariates, but including them in this model would make incorporating the resulting stationary state probabilities into the SDM predictions extremely difficult. Thus, we will run models including only the following predictors of state switching probability and compare by AIC.
+
+~ night.day
+~ region              
+~ brStatus            
+
+~ night.day + region
+~ night.day + brStatus
+~ region + brStatus
+
+~ night.day + region + brStatus
+
+Below, we build each of the above models, then compare by AIC to select our best model.
+
+### Single State Covariates
+
+#### time of day
+
+night_day_dd is defined using dawn and dusk from 'suncalc'
+
+``` {r ~ nightday-dd, include = T, eval = T, echo = T}
+
+form = ~ night_day_dd
+
+par0 <- momentuHMM::getPar0(model = HMMfit3s, formula = form)
+
+HMMfit3s_nightday <- momentuHMM::fitHMM(HMMprep, nbState = 3, 
+                            dist = list(step = "gamma", angle = "vm"),
+                            Par0 = par0$Par, 
+                            beta0 = par0$beta, 
+                            formula = form)
+
+
+HMMfit3s_nightday
+plot(HMMfit3s_nightday, plotTracks = F, ask = F, plotCI = T)
+plotStationary(HMMfit3s_nightday, plotCI = TRUE)
+momentuHMM::plotPR(HMMfit3s_nightday)
+
+saveRDS(HMMfit3s_nightday, paste0(output_loc, "/HMMfit3s_nightday_SDM.rds"))
+
+```
+
+#### location
+
+``` {r ~ region, include = T, eval = T, echo = T}
+
+form = ~ region
+
+par0 <- momentuHMM::getPar0(model = HMMfit3s, formula = form)
+
+HMMfit3s_reg <- momentuHMM::fitHMM(HMMprep, nbState = 3, 
+                            dist = list(step = "gamma", angle = "vm"), 
+                            Par0 = par0$Par, 
+                            beta0 = par0$beta, 
+                            formula = form)
+
+HMMfit3s_reg
+plot(HMMfit3s_reg, plotTracks = F, ask = F, plotCI = T)
+plotStationary(HMMfit3s_reg, plotCI = TRUE)
+momentuHMM::plotPR(HMMfit3s_reg)
+
+saveRDS(HMMfit3s_reg, paste0(output_loc, "/HMMfit3s_reg_SDM.rds"))
+
+```
+
+#### breeding status
+
+``` {r ~ statusBasic, include = T, eval = T, echo = T}
+
+form = ~ statusBasic
+
+par0 <- momentuHMM::getPar0(model = HMMfit3s, formula = form)
+
+HMMfit3s_stat <- momentuHMM::fitHMM(HMMprep, nbState = 3, 
+                            dist = list(step = "gamma", angle = "vm"),
+                            Par0 = par0$Par, 
+                            beta0 = par0$beta, 
+                            formula = form)
+
+HMMfit3s_stat
+plot(HMMfit3s_stat, plotTracks = F, ask = F, plotCI = T)
+plotStationary(HMMfit3s_stat, plotCI = TRUE)
+momentuHMM::plotPR(HMMfit3s_stat)
+
+saveRDS(HMMfit3s_stat, paste0(output_loc, "/HMMfit3s_stat_SDM.rds"))
+
+```
+
+### Multiple State Covariates
+
+##### nightday + region
+
+``` {r ~ nightday + region, include = T, eval = T, echo = T}
+
+form <- ~ night_day_dd + region
+
+par0 <- momentuHMM::getPar0(model = HMMfit3s, formula = form)
+
+HMMfit3s_tod.reg <- momentuHMM::fitHMM(HMMprep, 
+                                 nbStates = 3,
+                                 dist = list(step = "gamma", angle = "vm"),
+                                 Par0 = par0$Par, 
+                                 beta0 = par0$beta, 
+                                 formula = form)
+
+HMMfit3s_tod.reg
+plot(HMMfit3s_tod.reg, plotTracks = F, ask = F, plotCI = T)
+plotStationary(HMMfit3s_tod.reg, plotCI = TRUE)
+momentuHMM::plotPR(HMMfit3s_tod.reg)
+
+saveRDS(HMMfit3s_tod.reg, paste0(output_loc, "/HMMfit3s_tod.reg_SDM.rds"))
+
+```
+
+#### nightday + status
+
+``` {r ~ nightday + status, include = T, eval = T, echo = T}
+
+form <- ~ night_day_dd + statusBasic
+
+par0 <- momentuHMM::getPar0(model = HMMfit3s, formula = form)
+
+HMMfit3s_tod.stat <- momentuHMM::fitHMM(HMMprep, 
+                                 nbStates = 3,
+                                 dist = list(step = "gamma", angle = "vm"),
+                                 Par0 = par0$Par, 
+                                 beta0 = par0$beta, 
+                                 formula = form)
+
+HMMfit3s_tod.stat
+plot(HMMfit3s_tod.stat, plotTracks = F, ask = F, plotCI = T)
+plotStationary(HMMfit3s_tod.stat, plotCI = TRUE)
+momentuHMM::plotPR(HMMfit3s_tod.stat)
+
+saveRDS(HMMfit3s_tod.stat, paste0(output_loc, "/HMMfit3s_tod.stat_SDM.rds"))
+
+```
+
+#### region + status
+
+``` {r ~ region + status, include = T, eval = T, echo = T}
+
+form <- ~ region + statusBasic
+
+par0 <- momentuHMM::getPar0(model = HMMfit3s, formula = form)
+
+HMMfit3s_reg.stat <- momentuHMM::fitHMM(HMMprep, 
+                                 nbStates = 3,
+                                 dist = list(step = "gamma", angle = "vm"),
+                                 Par0 = par0$Par, 
+                                 beta0 = par0$beta, 
+                                 formula = form)
+
+HMMfit3s_reg.stat
+plot(HMMfit3s_reg.stat, plotTracks = F, ask = F, plotCI = T)
+plotStationary(HMMfit3s_reg.stat, plotCI = TRUE)
+momentuHMM::plotPR(HMMfit3s_reg.stat)
+
+saveRDS(HMMfit3s_reg.stat, paste0(output_loc, "/HMMfit3s_reg.stat_SDM.rds"))
+
+```
+
+#### region + nightday + status
+
+``` {r ~ region + nightday + status, include = T, eval = T, echo = T}
+
+form <- ~ region + night_day_dd + statusBasic
+
+par0 <- momentuHMM::getPar0(model = HMMfit3s, formula = form)
+
+HMMfit3s_reg.tod.stat <- momentuHMM::fitHMM(HMMprep, 
+                                 nbStates = 3,
+                                 dist = list(step = "gamma", angle = "vm"),
+                                 Par0 = par0$Par, 
+                                 beta0 = par0$beta, 
+                                 formula = form)
+
+HMMfit3s_reg.tod.stat
+plot(HMMfit3s_reg.tod.stat, plotTracks = F, ask = F, plotCI = T)
+plotStationary(HMMfit3s_reg.tod.stat, plotCI = TRUE)
+momentuHMM::plotPR(HMMfit3s_reg.tod.stat)
+
+saveRDS(HMMfit3s_reg.tod.stat, paste0(output_loc, "/HMMfit3s_reg.tod.stat_SDM.rds"))
+
+```
+
+### Compare models by AIC
+
+``` {r reload model objects, include = F, eval = F, echo = F}
+
+# Reload models if needed
+HMMfit3s <- readRDS(paste0(output_loc, "/HMMfit3s_SDM.rds")) 
+
+HMMfit3s_tod <- readRDS(paste0(output_loc, "/HMMfit3s_nightday_SDM.rds"))
+HMMfit3s_reg <- readRDS(paste0(output_loc, "/HMMfit3s_reg_SDM.rds"))
+HMMfit3s_mon <- readRDS(paste0(output_loc, "/HMMfit3s_stat_SDM.rds")) 
+
+HMMfit3s_tod.reg <- readRDS(paste0(output_loc, "/HMMfit3s_tod.reg_SDM.rds")) 
+HMMfit3s_tod.stat <- readRDS(paste0(output_loc, "/HMMfit3s_tod.stat_SDM.rds")) 
+HMMfit3s_reg.stat <- readRDS(paste0(output_loc, "/HMMfit3s_reg.stat_SDM.rds")) 
+
+HMMfit3s_reg.tod.stat <- readRDS(paste0(output_loc, "/HMMfit3s_reg.tod.stat_SDM.rds")) 
+
+```
+
+``` {r, include = T, eval = T, echo = T}
+
+AIC_tab <- AIC(HMMfit3s, HMMfit3s_tod, HMMfit3s_reg, HMMfit3s_stat, HMMfit3s_tod.reg, HMMfit3s_tod.stat, HMMfit3s_reg.stat, HMMfit3s_reg.tod.stat)
+
+# Add dAICs
+AIC_tab <- AIC_tab |>
+  mutate(dAIC_baseMod = AIC[Model == "HMMfit3s"] - AIC,
+         dAIC_nearestMod = lead(AIC) - AIC)
+
+kable(AIC_tab, caption = "AIC for state probability models - SDM version")
+
+write.csv(AIC_tab, paste0(output_loc, "/HMMfit3_noInts_AICtable_SDM.csv"), row.names = F)
+write.csv(AIC_tab, here::here("plots_man/HMMfit3_noInts_AICtable_SDM.csv"), row.names = F)
+
+```
+
+The best model includes all three covariates: *HMMfit3s_reg.tod.stat*
+
+### Get best model stationary state probabilities
+
+```{r}
+
+region <- c("Newfoundland", "Scotian Shelf")
+tod <- c("day", "night")
+status <- c("incubation", "chick-rearing")
+
+covsTab <- expand.grid(region = region, night_day_dd = tod, statusBasic = status)
+
+output <- data.frame()
+
+for(i in 1:nrow(covsTab)){
+  
+  j <- stationary(HMMfit3s_reg.tod.stat, covs = data.frame(covsTab[i,]))
+  
+  output <- rbind(output, cbind(covsTab[i,], j))
+  
+}
+
+output <- output |>
+  rename(`Intensive search` = `state 1`, Transit = `state 2`, `Extensive search` = `state 3`, tod = night_day_dd, status = statusBasic) |>
+  dplyr::select(region, tod, status, `Intensive search`, `Extensive search`, Transit)
+
+saveRDS(output, paste0(output_loc, "/HMM_stationary_states.rds"))
+saveRDS(output, here::here("input_data/HMM_stationary_states.rds"))
+
+# Plots
+plotStationary(HMMfit3s_reg.tod.stat, covs = covsTab[5,], plotCI = TRUE)
+
+```
+
+## Save predicted states for base model, final model
+
+We include both the base model without covariates and the full model with all three covariates here to allow for the comparison of predicted states.
+
+We also include different possible definitions of the two behavioural risk categories (in-air, on-water) for the species distribution model, based on our three HMM states. 
+
+We ultimately selected the combination of Transit and Extensive Search to represent predominantly 'in-air' behaviour based on our knowledge of the species (column 'states3_cov_te.i'). Those are the predictions used in our species distribution model.
+
+``` {r predict states, include = T, eval = T}
+
+# Get the predicated states
+HMMclassified <- HMMprep
+HMMclassified$states3 <- momentuHMM::viterbi(HMMfit3s)
+HMMclassified$states3_cov <- momentuHMM::viterbi(HMMfit3s_reg.tod.stat)
+
+# Check to ensure we know which state is which
+plot(HMMfit3s, plotTracks = F, ask = F)
+plot(HMMfit3s_reg.tod.stat, plotTracks = F, ask = F)
+# State 1 is intensive/rest, 2 is transit, 3 is extensive
+
+# Label states, order factors
+# Add columns combining the transit and extensive states  [this is the column/definition we use in our SDM = 'in-air' risk category]
+# Add column combining the extensive and intensive states [we did not use this column/definition]
+HMMclassified <- HMMclassified |>
+  mutate(states3 = as.factor(ifelse(states3 == 1, "Intensive search",
+                              ifelse(states3 == 2, "Transit", "Extensive search"))),
+         states3_t.ei = as.factor(ifelse(states3 == "Transit", "Transit", "Foraging")),
+         states3_te.i = as.factor(ifelse(states3 == "Intensive search", "Foraging", "Transit")),
+         
+         states3_cov = as.factor(ifelse(states3_cov == 1, "Intensive search",
+                              ifelse(states3_cov == 2, "Transit", "Extensive search"))),
+         states3_cov_t.ei = as.factor(ifelse(states3_cov == "Transit", "Transit", "Foraging")),
+         states3_cov_te.i = as.factor(ifelse(states3_cov == "Intensive search", "Foraging", "Transit")),
+         
+         states3 = ordered(states3, levels = c("Transit", "Extensive search", "Intensive search")),
+         states3_t.ei = ordered(states3_t.ei, levels = c("Transit", "Foraging")),
+         states3_te.i = ordered(states3_te.i, levels = c("Transit", "Foraging")),
+         states3_cov = ordered(states3_cov, levels = c("Transit", "Extensive search", "Intensive search")),
+         states3_cov_t.ei = ordered(states3_cov_t.ei, levels = c("Transit", "Foraging")),
+         states3_cov_te.i = ordered(states3_cov_te.i, levels = c("Transit", "Foraging")))
+         
+# Save data with 3 state results
+saveRDS(HMMclassified, paste0(output_loc, "/HMM_classified_data.rds"))
+saveRDS(HMMclassified, here::here("input_data/HMM_classified_data.rds"))
+
+```

@@ -1,0 +1,258 @@
+---
+title: "Leach's storm petrel"
+subtitle: "Cleaned GPS data to regularized dataset for HMM" 
+author: "Katharine Studholme, Allison Patterson, Isabeau Pratte"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+output: html_document
+---
+
+This script is the work flow we followed to get the clean trips dataset regularized (2hr interval) and prepared for the Hidden Markov Model.
+
+```{r setup, include=T, echo = T, message = F, warning = F}
+
+source(here::here("R/functions.R"), echo = F)
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, include = F, message = F, warning = F, tidy = T, tidy.opts = list(width.cutoff = 80))
+library(dplyr)
+library(lubridate)
+
+```
+
+# Import the cleaned tripSplit data
+
+Remove all locations within the inner buffer (10km) in preparation for running the Hidden Markov Model. These positions will not be modelled in our SDM and will effectively be treated as 'on-colony' locations.
+
+It's ok to analyze short or incomplete trips in HMM, but we don't want to analyze trips with significant data gaps. These with >30% missing positions have already been labelled as "gappy trips". We will drop those from the dataset here as well. 
+
+```{r, include = T}
+
+data_tripSplit_df <- readRDS(here::here("raw_data/data_tripSplit_df.rds")) |>
+  filter(ColDist > 10000) |>
+  filter(trip_typeBasic != "gappy trip")
+
+```
+
+# Interpolated dataset to feed into the HMM modelling
+
+## Use 'crawl' to interpolate to 2hr intervals 
+
+```{r crawl-2hr, include = T}
+
+time_step <- '2 hour'
+
+# crawl requires projection that preserves distance. We use azimuthal equal area centered on our gps positions
+latCtr <- mean(data_tripSplit_df$Latitude)
+lonCtr <- mean(data_tripSplit_df$Longitude)
+my_crs <- paste0('+proj=aeqd +lon_0=', lonCtr, ' +lat_0=', latCtr, ' +datum=WGS84 +units=m +no_defs')
+
+# convert to spatial features object and transform to equidistant projection
+gps_sf <- sf::st_as_sf(data_tripSplit_df, coords = c('Longitude', 'Latitude'), crs = 4326)
+gps_sf <- sf::st_transform(gps_sf, my_crs)
+
+# generate a list of prediction times for each individual
+# The built-in timeStep function in crawlWrap will sometimes generate locations AFTER the last recorded time and those can be highly imprecise. This just forces it to stay within the observed time range 
+# To avoid issues with on-colony locations, we want to do all this at the tripID level not the individual level (ID)
+
+predTime <- data_tripSplit_df |>
+  dplyr::group_by(tripID) |>
+  dplyr::summarize(
+    start = min(DateTime),
+    end = max(DateTime))
+
+pt <- lapply(1:nrow(predTime), function(x) seq.POSIXt(predTime$start[x], predTime$end[x], time_step))
+
+names(pt) <- predTime$tripID
+
+# Use crawl to interpolate gps data at 2hr time step
+
+# Use conservative estimate of GPS error of 50m
+lnError <- crawl::argosDiag2Cov(50,50,0) # 50 m isotropic error ellipse 
+
+# format data for crawl
+crawlData <- data.frame(ID = data_tripSplit_df$tripID,
+                        time = data_tripSplit_df$DateTime,
+                        x = sf::st_coordinates(gps_sf)[,1],
+                        y = sf::st_coordinates(gps_sf)[,2],
+                        ln.sd.x = lnError$ln.sd.x,
+                        ln.sd.y = lnError$ln.sd.y,
+                        error.corr = lnError$error.corr)
+
+# run the interpolation (takes ~ 1.5hrs)
+crwOut <- momentuHMM::crawlWrap(crawlData,
+                    theta = c(6.5,-.1),
+                    fixPar = c(1,1,NA,NA),
+                    err.model = list(x = ~ln.sd.x-1,
+                                     y = ~ln.sd.y-1,
+                                     rho = ~error.corr),
+                    attempts = 100, # if you are getting errors, you usually can fix them y increasing this
+                    #timeStep = time_step, # can cause issues, use predTime
+                    predTime = pt)
+
+# Convert to HMMprep format
+crwOutHMM <- momentuHMM::prepData(crwOut) |>
+  dplyr::select(-c(TimeNum, locType)) |>
+  rename(DateTime = time)
+
+# Add latitude and longitude columns
+crwOutHMM_sf <- sf::st_as_sf(crwOutHMM, coords = c("x", "y"), crs = my_crs)
+crwOutHMM_sf <- sf::st_transform(crwOutHMM_sf, crs = 4326)
+coords <- do.call(rbind, sf::st_geometry(crwOutHMM_sf)) |> 
+    as_tibble() |> setNames(c("Longitude","Latitude"))
+crwHMM <- sf::st_drop_geometry(crwOutHMM_sf) |>
+  bind_cols(coords)
+
+```
+
+## Restore trip-level metadata
+
+The information we need is at the trip level, so we summarize to trip and then join.
+
+```{r tripMeta, include = T}
+
+addMeta <- data_tripSplit_df |>
+  rename(birdID = ID) |>
+  dplyr::select(colony, birdID, tripID, tagProg, band, Year, track_filename, sex, status, lon.col, lat.col, Returns, StartsOut, trip_type, trip_typeBasic, colonyBasic, statusBasic, sexBasic) |>
+  distinct()
+
+# join
+crwHMM <- crwHMM |>
+  left_join(addMeta, by = c("ID" = "tripID"))
+
+```
+
+# Add observation-level covariates for HMM
+
+We originally wanted to examine the potential effects of time of day in our HMM model using several different definitions: simple day vs night based on sunrise and sunset, simple day vs night based on sun altitude, hour of the day in local time zone, and scaled time of day (based on sunrise, sunset, and daylength).
+
+For our final HMM model, we use only the simple day vs night categorical variable based on sunrise and sunset as this outperformed the equivalent based on sun altitude when we compared 3 state HMMs using these covariates by AIC. We did not use the continuous variables for time of day in our HMM. These continuous variables should be considered for detailed studies of foraging behaviour, but were not tractable to use in the context of incorporating the HMM results into our species distribution model and predicting numbers of birds at sea at night to assess risk of exposure to artificial light.
+
+## Calculate local time for each location
+
+```{r, include = T}
+
+# Add column for time zone of each position
+crwHMM <- crwHMM |>
+  mutate(tzone = lutz::tz_lookup_coords(lat = crwHMM$Latitude, lon = crwHMM$Longitude, method = "fast"))
+
+# Convert UTC to local time zone for each position, extract decimal hour in local time
+# Do this so crwHMM is not converted to a data.frame (stays momentuHMM)
+
+hList <- list()
+
+for (i in 1:nrow(crwHMM)) {
+  
+  datetime_tz <- with_tz(crwHMM[i,]$DateTime, tzone = crwHMM[i,]$tzone)
+  hList[[i]] <- as.numeric(hour(datetime_tz) * 60 + minute(datetime_tz) + second(datetime_tz) / 60)/60
+  
+}
+
+# join hour_tz to dataset
+crwHMM_02 <- crwHMM |>
+  mutate(hour_tz = unlist(hList))
+
+```
+
+## Add day/night and scaled time of day variables
+
+Given the data resolution, differentiating 'day' and 'night' based on civil twilight vs nautical twilight will make little to no difference. We chose to include civil twilight periods in 'day' and nautical twilight periods in 'night', dividing these periods using times for 'dusk' and 'dawn'.
+
+Note: Sometimes in the summer there is no nauticalDawn/nauticalDusk. Also, in some cases nauticalDusk can be generated for the following date because true darkness did not occur until after midnight! In the range of our data, we seem to always at least get 'dawn' and 'dusk' (unlike Iceland!).
+
+We are also interested in a scaled time of day variable to deal with ~3hr difference in day length over our study period and develop a method based on % of daytime or nighttime elapsed.
+
+```{r, include = T}
+
+# DateTime column is in UTC
+# Add columns matching those required by suncalc rather than renaming, and remove when we're done
+
+crwHMM_03 <- crwHMM_02 |>
+  mutate(date = DateTime,
+         lon = Longitude,
+         lat = Latitude)
+
+# Get sun altitude for given location and time
+# Convert `date` to date (not datetime) for next step
+
+crwHMM_04 <- crwHMM_03 |>
+  mutate(sunAlt = suncalc::getSunlightPosition(data = crwHMM_03, keep = c("altitude"))[,4],
+         date = as.Date(date))
+
+# These functions require "date" column as date format, not datetime
+
+crwHMM_05 <- crwHMM_04 |>
+  mutate(sunrise_UTC = suncalc::getSunlightTimes(data = crwHMM_04, keep = c("sunrise"), tz = "UTC")[,4],
+         sunset_UTC = suncalc::getSunlightTimes(data = crwHMM_04, keep = c("sunset"), tz = "UTC")[,4],
+         dawn_UTC = suncalc::getSunlightTimes(data = crwHMM_04, keep = c("dawn"), tz = "UTC")[,4],
+         dusk_UTC = suncalc::getSunlightTimes(data = crwHMM_04, keep = c("dusk"), tz = "UTC")[,4]) |>
+  dplyr::select(-c(date, lon, lat))
+
+
+## Add derived variables
+
+# Define night-day column based on 1) sunAlt (similar to sunrise/sunset) and 2) dusk and dawn (consistent with what we think may be meaningful 'light' and 'dark' for petrels)
+
+# Include 'scaled' time of day variable correcting for differences in day length. 0 is sunrise, 1 sunset, and 2 is end of night. Day length and night length will appear equal lengths in plots.
+
+crwHMM_06 <- crwHMM_05 |>
+  mutate(night_day_dd = as.factor(ifelse(DateTime > dawn_UTC & DateTime < dusk_UTC, "day", "night")),
+         night_day_sunAlt = as.factor(ifelse(sunAlt > 0, "day", "night")),
+         daylength = as.numeric(difftime(sunset_UTC, sunrise_UTC, units = "hours")),
+         nightlength = 24-daylength,
+         t_from_rise = as.numeric(difftime(DateTime, sunrise_UTC, units = "hours")),
+         pct_day = ifelse(DateTime >= sunrise_UTC & DateTime <= sunset_UTC, t_from_rise/daylength, NA),
+         pct_night = ifelse(t_from_rise < 0, (nightlength + t_from_rise)/nightlength, 
+                            ifelse(DateTime > sunset_UTC, (t_from_rise - daylength)/nightlength, NA)), 
+         scale_tod = ifelse(!is.na(pct_day), pct_day, (1+pct_night))) |>
+  dplyr::select(-c(sunrise_UTC, sunset_UTC, dawn_UTC, dusk_UTC, t_from_rise, pct_day, pct_night))
+
+```
+
+
+## Finalize 
+
+```{r, include = T}
+
+# rename final 2h dataset, rename DateTime
+
+data_tripSplit_2h <- crwHMM_06 |>
+  rename(datetime = DateTime)
+
+saveRDS(data_tripSplit_2h, here::here("input_data/data_tripSplit_2h.rds"))
+
+```
+
+## Save visual of each 2h interpolated trip in a folder
+
+Here we run a function that saves a visual of each trip in a folder, just to help us see if the trips are properly split, to the best of what the dataset enable us to do. Output file paths are legacy - please enter your own file paths if you want to regenerate and save these plots. 
+
+Plots include a title and file name indicating if the track is complete, incomplete, short, or gappy (trip_type). A unique identifier is also included in the title and file name. A red circle indicates the colony location. Lines were added between points to simplify following the trajectory. 
+
+```{r, echo = F, eval = F}
+
+if (dir.exists(here::here('output_data/clean_data/png/trips2h')) == FALSE) dir.create(here::here('output_data/clean_data/png/trips2h'), recursive = T)
+output_png <- here::here('output_data/clean_data/png/trips2h')
+
+# Add simple dataset of colony lat lon
+colonies <- read.csv(here::here("raw_data/colony.csv"))
+
+IDS <- unique(data_tripSplit_2h$ID)
+
+for (i in 1:length(IDS)) {
+  id <- subset(data_tripSplit_2h, ID == IDS[i])
+  colonyID <- subset(colonies, colony == id$colony[1])
+  # Add colony position to id dataset so it's always within the x and y limits
+  id2 <- plyr::rbind.fill(id, colonyID)
+  # Now plot
+  #quartz(width=10, height=10) #use for saving plot - Mac only
+  windows(width=10, height=10) #for Windows users
+  plot(Latitude~Longitude, data = id2, type = "o", asp = 1, main = paste0(id2$status[1], ", ", id2$trip_type[1], ", ", IDS[i]))
+  points(lat~lon, data = colonyID, type = "p", col = "red")
+  maps::map("world", add=T)
+  #quartz.save(file=(paste0(id2[i],'.png')), type = "png", device = dev.cur(), dpi = 100)
+  savePlot(file= paste0(output_png, "/", id2$status[1], " - ", IDS[i], '.png'), type = "png", device = dev.cur()) #for Windows users
+  dev.off()
+}
+
+```

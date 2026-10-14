@@ -1,0 +1,731 @@
+---
+title: "Platform proximity and exposure assessment"
+author: "Dave Fifield, Sydney Collins, Katharine Studholme"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+---
+
+```{r setup, include=F}
+
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
+
+renv::restore(lockfile = here::here('renv.lock'))
+
+library(sf)
+library(tidyverse)
+library(geosphere)
+library(sp)
+library(magrittr)
+library(foreach)
+library(doParallel)
+
+dir.create(here::here("output_data/platform_proximity"), recursive = TRUE, showWarnings = FALSE)
+
+```
+
+In this script we first calculate the single closest passage by an offshore petroleum facility (point) for each foraging trip in our dataset. We then calculate all the potential exposures (passage within the light or oil spill footprint of an offshore petroleum facility point) for each foraging trip and determine whether these passages occurred under vulnerable conditions - at night in any behavioural state for exposure to light, at any time of day while the bird was in the 'on-water' behavioural state for exposure to oil. 
+
+We identify and summarize cases of multiple exposures and calculate the proportion of exposed trips per bird. Where possible, we summarize these results by colony and breeding status.
+
+# Single closest event - platform proximity function
+
+Slight modifications to the function provided by Dave Fifield, built for Sydney Collins thesis at Memorial University.
+
+This function finds the single closest approach of a foraging track to a point within a set of points provided by the user - in this case offshore petroleum facilities.
+
+We use only complete trips for this analysis
+
+```{r ppx-function}
+
+# Function to find the closest approach of a single track (trk) to a set of points (pnts).
+#
+# Implements both the "closest track point" and "closest trackline location" methods.
+#
+# Inputs:
+#   trk - dataframe with at least columns ID, BirdID, lon, lat. The rows are consecutive
+#         positions for a single track from a single animal.
+#   pnts - dataframe of fixed points with columns: name, lon, lat, which represent fixed
+#         objects (e.g., rigs)
+#   plotit - (default TRUE) should a map be produced?
+#
+# Result:
+#   Returns a single-row dataframe with columns:
+#   ID - same as trk
+#   BirdID - same as trk
+#   point.dist - shortest distance between a **point** included in trk and the 
+#     nearest point in pnts. 
+#   point.rownum - the row number of the point closest to pnts.
+#   point.lon - longitude of closest point in trk 
+#   point.lat - latitude of closest point in trk 
+#   point.pnt.name - name of the element of pnts that was closest to the track point
+#   trk.dist - shortest distance between the **assumed track line** 
+#     (i.e., assumed straight lines between points in trk) and the nearest point in pnts.
+#   trk.lon - longitude of closest position along the trk line
+#   trk.lat - latitude of closest position along the trk line
+#   trk.pnt.name - name of the element of pnts that was closest to track line
+
+findClosestDistance <- function(trk, pnts, plotit = TRUE) {
+  
+  res <- data.frame(colony = unique(trk$colony), ID = unique(trk$ID), BirdID = unique(trk$BirdID))
+  
+  # Method 1. Find distance from nearest element of pnts to a point in trk
+  
+  # Get distance between all track points and each point in pnts.
+  dists <- spDists(cbind(trk$lon, trk$lat), cbind(pnts$lon, pnts$lat), longlat = TRUE)
+  
+  # Get the row and column index of the minimum distance. Note the "[1,]" at the 
+  # end is just in case there is more than one pnt equidistant from a trk point 
+  # in which case we just choose the first one.
+  min.element <- which(dists == min(dists), arr.ind = T)[1,]
+  res %<>% mutate(point.dist = min(dists),
+                  point.lat = trk[min.element["row"], "lat"],
+                  point.lon = trk[min.element["row"], "lon"],
+                  point.status = trk[min.element["row"], "status"],
+                  point.datetime = trk[min.element["row"], "datetime"],
+                  point.tod = trk[min.element["row"], "tod"],
+                  point.states3 = trk[min.element["row"], "states3"],
+                  point.statesAW = trk[min.element["row"], "statesAW"],
+                  point.rownum = min.element["row"],
+                  point.pnt.name = pnts$name[min.element["col"]],
+                  point.pnt.name = pnts$name[min.element["col"]])
+  
+  # Method 2. Find distance from track line to nearest element of pnts 
+
+  # Get distance from each pnt to the track
+  dists = dist2Line(cbind(pnts$lon, pnts$lat), cbind(trk$lon, trk$lat))
+  min.row <- which.min(dists[, "distance"])
+  res %<>% mutate(trk.dist = dists[min.row, "distance"]/1000,
+                  trk.lat = dists[min.row, "lat"],
+                  trk.lon = dists[min.row, "lon"],
+                  trk.pnt.name = pnts$name[min.row])
+  
+  # plot trk
+  if (plotit) {
+    cbind(trk$lon, trk$lat) %>% 
+      makeLine() %>% 
+      plot(type = "l", 
+           main = paste0(as.character(res$ID), 
+             ", Point: ", res$point.pnt.name, ", ",round(res$point.dist, 1), " km",
+             ", Trackline: ", res$trk.pnt.name, ", ",round(res$trk.dist, 1), " km"),
+           xlim = range(c(trk$lon, pnts$lon)), 
+           ylim = range(c(trk$lat, pnts$lat)))
+    points(cbind(trk$lon, trk$lat))
+    
+    # plot pnts
+    points(cbind(pnts$lon, pnts$lat), col = 'blue', pch = 20)
+    
+    # line between closest track point to closest pnt
+    points(res$point.lon, res$point.lat, col = "red")
+    lines(c(res$point.lon, pnts$lon[which(pnts$name == res$point.pnt.name)]), 
+          c(res$point.lat, pnts$lat[which(pnts$name == res$point.pnt.name)]), col = "red")
+    
+    # Line of between closest track-line location and pnt
+    points(res$trk.lon, res$trk.lat, col = "blue", pch = "x")
+    lines(c(res$trk.lon, pnts$lon[which(pnts$name == res$trk.pnt.name)]), 
+          c(res$trk.lat, pnts$lat[which(pnts$name == res$trk.pnt.name)]), col = "blue")
+  }
+  
+  return(res)
+}
+
+```
+
+##Read data
+
+Omit incomplete trips to assess the closest passage per trip on trips known to be complete.
+
+```{r}
+
+# Load HMM data/tracks
+trk <- readRDS(here::here("input_data/HMM_classified_data.rds")) |>
+  dplyr::filter(trip_typeBasic != "incomplete trip") |>
+  dplyr::select(colonyBasic, ID, birdID, datetime, night_day_dd, Longitude, Latitude, sex, statusBasic, trip_typeBasic, states3_cov, states3_cov_te.i) |>
+  dplyr::rename(lon = Longitude,
+                lat = Latitude, 
+                BirdID = birdID,
+                states3 = states3_cov,
+                statesAW = states3_cov_te.i,
+                tripType = trip_typeBasic,
+                tod = night_day_dd,
+                colony = colonyBasic,
+                status = statusBasic)
+
+# Load platform locations  
+pnts <- read.csv(here::here("raw_data/threats/threats_offshorePetro_productionInstallationPts.csv")) |>
+  rename(name = ID) |>
+  select(name, lat, lon)
+
+```
+
+## Run function for each trip
+
+```{r ppx-run}
+
+# Call findClosestDistance() repeatedly, once for each GPS track.
+# Each row in the resulting "dists" corresponds to a single track from gps.
+
+# Format to use parallel processing 
+myCluster <- makeCluster(15)
+registerDoParallel(myCluster)
+
+outList <- foreach(i = 1:length(unique(trk$ID))) %dopar% {
+  
+  gc()
+  
+  library(sf)
+  library(tidyverse)
+  library(here)
+  library(geosphere)
+  library(sp)
+  library(magrittr)
+  
+  trip <- unique(trk$ID)[i]
+  
+  findClosestDistance(trk = trk[which(trk$ID == trip),], pnts = pnts, plotit = FALSE)
+  
+}
+
+stopCluster(myCluster)
+
+# Collapse list to single dataframe
+out <- dplyr::bind_rows(outList)
+
+saveRDS(out, here::here("output_data/platform_proximity/PlatformProximity_closestPass_byTrip.rds"))
+
+```
+
+## Summarize closest passage distance
+
+```{r, nbirds}
+
+# Use track distance for distance (point.dist)
+# and point for behavioural state (trk.dist)
+
+# Summarize closest passage by colony and breeding stage
+# mean, se, min closest pass distance
+
+# Trips
+sumCol_trips <- out |>
+  group_by(colony) |>
+  summarize(n = n(),
+            meanDist = mean(trk.dist),
+            seDist = sd(trk.dist)/sqrt(n),
+            minDist = min(trk.dist))
+
+sumColStatus_trips <- out |>
+  group_by(colony, point.status) |>
+  summarize(n = n(),
+            meanDist = mean(trk.dist),
+            seDist = sd(trk.dist)/sqrt(n),
+            minDist = min(trk.dist))
+
+# Birds
+sumCol_birds <- out |>
+  group_by(BirdID) |>
+  slice_min(trk.dist, n = 1) |>
+  ungroup() |>
+  group_by(colony) |>
+  summarize(n = n(),
+            meanDist = mean(trk.dist),
+            seDist = sd(trk.dist)/sqrt(n),
+            minDist = min(trk.dist),
+            .groups = "drop_last") 
+
+sumColStatus_birds <- out |>
+  group_by(BirdID) |>
+  slice_min(trk.dist, n = 1) |>
+  ungroup() |>
+  group_by(colony, point.status) |>
+  summarize(n = n(),
+            meanDist = mean(trk.dist),
+            seDist = sd(trk.dist)/sqrt(n),
+            minDist = min(trk.dist),
+            .groups = "drop_last") 
+
+```
+
+# Multiple Exposures: Close-Passage Threshold Function
+
+For the exposure summary, we want to determine all the trips/birds that pass within the NS or NL light footprints or the theoretical oil footprint. The single closest passage point from the function above might not be the only one within these footprints. In cases where more than one point or passage occurs in the footprints, all these points/passages should be checked for behavioural state and time of day to determine exposure. To do this, we use the state of the point if a point falls within the footprint, or the state of the closest point if only the trackline falls within the footprint. Multiple passages are especially likely for Country Island birds.
+
+For this analysis, we want to use ALL trips, not just the complete ones - including any evidence of exposure if it is present in the available data.
+
+## Re-read data with all trips
+
+```{r load-dat}
+
+# Load HMM data/tracks, keep all trips (including incomplete)
+trk <- readRDS(here::here("input_data/HMM_classified_data.rds")) |>
+  dplyr::select(colonyBasic, ID, birdID, datetime, night_day_dd, Longitude, Latitude, sex, statusBasic, trip_typeBasic, states3_cov, states3_cov_te.i) |>
+  dplyr::rename(lon = Longitude,
+                lat = Latitude, 
+                BirdID = birdID,
+                states3 = states3_cov,
+                statesAW = states3_cov_te.i,
+                tripType = trip_typeBasic,
+                tod = night_day_dd,
+                colony = colonyBasic,
+                status = statusBasic)
+
+```
+
+Define the revised function:
+
+```{r ppx-function}
+
+# Function to find the all locations in a single track (trk) within a given distance threshold of a set of points (pnts).
+#
+# Implements both the "closest track point" and "closest trackline location" methods.
+# For cases where the trackline is closest, characteristics (e.g. time of day, HMM state) are obtained from the nearest track point
+#
+# Inputs:
+#   trk - dataframe with at least columns ID, BirdID, lon, lat. The rows are consecutive
+#         positions for a single track from a single animal.
+#   pnts - dataframe of fixed points with columns: name, lon, lat, which represent fixed
+#         objects (e.g., rigs)
+#   thresh - distance threshold in meters (radius of threat footprint) to retain close passage record
+#   plotit - (default TRUE) should a map be produced?
+#   plotdir - directory in which to save the plot
+#
+# Result:
+#   Returns a dataframe with one row per line/point that is within the threshold distance of a pnts location with columns:
+#   ID - same as trk
+#   BirdID - same as trk
+#   point.dist - shortest distance between a **point** included in trk and the 
+#     nearest point in pnts. 
+#   point.rownum - the row number of the point closest to pnts.
+#   point.lon - longitude of closest point in trk 
+#   point.lat - latitude of closest point in trk 
+#   point.pnt.name - name of the element of pnts that was closest to the track point
+#   trk.dist - shortest distance between the **assumed track line** 
+#     (i.e., assumed straight lines between points in trk) and the nearest point in pnts.
+#   trk.lon - longitude of closest position along the trk line
+#   trk.lat - latitude of closest position along the trk line
+#   trk.pnt.name - name of the element of pnts that was closest to track line
+#   min.dist - shortest distance from the trackline or points method
+#   within.point - T/F was the point within the threshold distance?
+#   within.trackline - T/F was the closest point along the trackline within the threshold distance?
+
+findThresholdRecords <- function(trk, pnts, thresh, plotit = TRUE, plotdir = NULL) {
+  
+  # Method 1. Distance from each trk point to each pnt
+  dists1 <- spDists(cbind(trk$lon, trk$lat), cbind(pnts$lon, pnts$lat), longlat = TRUE)
+  
+  # Method 2. Distance from each pnt to the trackline
+  dists2 <- suppressWarnings(
+    dist2Line(cbind(pnts$lon, pnts$lat), cbind(trk$lon, trk$lat))
+  )
+  dists2.km <- dists2[, "distance"] / 1000
+  
+  # --- Method 1 rows: one per trk point within thresh of any pnt ---
+  # Find row/col indices where distance <= thresh
+  within1 <- which(dists1 <= thresh, arr.ind = TRUE)  # row = trk index, col = pnt index
+  
+  if (nrow(within1) > 0) {
+    res1 <- data.frame(
+      colony         = trk$colony[within1[, "row"]],
+      ID             = trk$ID[within1[, "row"]],
+      BirdID         = trk$BirdID[within1[, "row"]],
+      point.pnt.name = pnts$name[within1[, "col"]],
+      point.dist     = dists1[within1],
+      point.lat      = trk$lat[within1[, "row"]],
+      point.lon      = trk$lon[within1[, "row"]],
+      point.status   = trk$status[within1[, "row"]],
+      point.datetime = trk$datetime[within1[, "row"]],
+      point.tod      = trk$tod[within1[, "row"]],
+      point.states3  = trk$states3[within1[, "row"]],
+      point.statesAW = trk$statesAW[within1[, "row"]],
+      point.rownum   = within1[, "row"],
+      trk.dist       = NA,
+      trk.lat        = NA,
+      trk.lon        = NA,
+      method         = "point",
+      stringsAsFactors = FALSE
+    )
+  } else {
+    res1 <- data.frame()
+  }
+  
+  # --- Method 2 rows: one per pnt where trackline passes within thresh ---
+  pnts.within.trackline <- which(dists2.km <= thresh)
+  
+  if (length(pnts.within.trackline) > 0) {
+    res2.list <- lapply(pnts.within.trackline, function(p) {
+      
+      # Assign point.* columns from nearest trk point to the trackline location
+      trk.loc <- c(dists2[p, "lon"], dists2[p, "lat"])
+      trk.dists.to.loc <- spDists(cbind(trk$lon, trk$lat), 
+                                   matrix(trk.loc, nrow = 1), 
+                                   longlat = TRUE)
+      nearest.row <- which.min(trk.dists.to.loc)
+      
+      data.frame(
+        colony         = trk$colony[1],
+        ID             = trk$ID[1],
+        BirdID         = trk$BirdID[1],
+        point.pnt.name = pnts$name[p],
+        point.dist     = min(dists1[, p]),  # nearest trk point to this pnt
+        point.lat      = trk$lat[nearest.row],
+        point.lon      = trk$lon[nearest.row],
+        point.status   = trk$status[nearest.row],
+        point.datetime = trk$datetime[nearest.row],
+        point.tod      = trk$tod[nearest.row],
+        point.states3  = trk$states3[nearest.row],
+        point.statesAW = trk$statesAW[nearest.row],
+        point.rownum   = nearest.row,
+        trk.dist       = dists2.km[p],
+        trk.lat        = dists2[p, "lat"],
+        trk.lon        = dists2[p, "lon"],
+        method         = "trackline",
+        stringsAsFactors = FALSE
+      )
+    })
+    res2 <- do.call(rbind, res2.list)
+  } else {
+    res2 <- data.frame()
+  }
+  
+  # Combine both methods
+  res <- bind_rows(res1, res2)
+  
+  if (nrow(res) == 0) {
+    message("No pnts found within threshold distance via either method.")
+    return(data.frame())
+  }
+  
+  # Minimum distance across both methods
+  res$min.dist <- pmin(res$point.dist, res$trk.dist, na.rm = TRUE)
+  
+  if (plotit & !is.null(plotdir)) {
+    
+    if (!dir.exists(plotdir)) dir.create(plotdir, recursive = TRUE)
+    
+    trip <- unique(trk$ID)[1]
+    png(file.path(plotdir, paste0(trip, ".png")),
+        width = 1920, height = 1080, res = 150)
+    
+    cbind(trk$lon, trk$lat) %>%
+      makeLine() %>%
+      plot(type = "l",
+           main = paste0(trip, " — pnts within ", thresh, " km"),
+           xlim = range(c(trk$lon, pnts$lon)),
+           ylim = range(c(trk$lat, pnts$lat)))
+    points(cbind(trk$lon, trk$lat))
+    points(cbind(pnts$lon, pnts$lat), col = 'blue', pch = 20)
+    
+    # Orange: Method 1 rows
+    res1.plot <- res[res$method == "point", ]
+    for (i in seq_len(nrow(res1.plot))) {
+      pnt.match <- which(pnts$name == res1.plot$point.pnt.name[i])
+      points(res1.plot$point.lon[i], res1.plot$point.lat[i], col = "red")
+      lines(c(res1.plot$point.lon[i], pnts$lon[pnt.match]),
+            c(res1.plot$point.lat[i], pnts$lat[pnt.match]), col = "red")
+    }
+    
+    # Blue: Method 2 rows
+    res2.plot <- res[res$method == "trackline", ]
+    for (i in seq_len(nrow(res2.plot))) {
+      pnt.match <- which(pnts$name == res2.plot$point.pnt.name[i])
+      points(res2.plot$trk.lon[i], res2.plot$trk.lat[i], col = "blue", pch = 4)
+      lines(c(res2.plot$trk.lon[i], pnts$lon[pnt.match]),
+            c(res2.plot$trk.lat[i], pnts$lat[pnt.match]), col = "blue")
+    }
+    
+    legend("bottomright",
+           legend = c("O&G facilities", "trk point in thresh", "nearest pnt on trackline"),
+           col    = c("blue", "red", "blue"),
+           pch    = c(20, 1, 4),
+           lty    = c(NA, 1, 1))
+    
+    dev.off()
+  }
+  
+  return(res)
+}
+
+```
+
+## Run function for each trip 
+
+We use the hypothetical oil footprint (8km) as the threshold. This is larger than the light footprints so we can extract the light exposures from the results after the function has run (consider only passages within 1.2 km for NS, 5.3 km for NL).
+
+```{r ppx-run-oil}
+
+# Call findThresholdRecords() repeatedly, once for each GPS track.
+
+myCluster <- makeCluster(20)
+registerDoParallel(myCluster)
+
+outList <- foreach(i = 1:length(unique(trk$ID))) %dopar% {
+  
+  gc()
+  
+  library(sf)
+  library(tidyverse)
+  library(here)
+  library(geosphere)
+  library(sp)
+  library(magrittr)
+  
+  trip <- unique(trk$ID)[i]
+
+  result <- tryCatch(
+  findThresholdRecords(trk = trk[which(trk$ID == trip),], pnts = pnts, thresh = 8, plotit = TRUE, plotdir = here::here("output_data/platform_proximity/8km-threshold-plots")),
+  error = function(e) {
+      message("Error for ID: ", trip, " — ", e$message)
+      NULL
+    }
+  )
+
+  result
+  
+}
+
+stopCluster(myCluster)
+
+# Collapse list to single dataframe
+out <- dplyr::bind_rows(outList)
+
+saveRDS(out, here::here("output_data/platform_proximity/PlatformProximity_allRecordsInOilFootprint_8km.rds"))
+
+```
+
+## Birds exposed to oil
+
+Summarize proportion in the oil footprint vs exposed (in oil footprint in 'on-water'/foraging behavioural state) separately.
+
+```{r}
+
+# Percentage, all states
+bird.status <- trk |>
+  group_by(colony, status) |>
+  summarize(nBirds = length(unique(BirdID)))
+
+# Proportions in oil footprint and exposed
+oilFP <- out |>
+  rename(status = point.status) |>
+  group_by(colony, status) |>
+  summarize(nBirds_oilFP = length(unique(BirdID)),
+            .groups = "drop_last")
+
+oilExp <- out |>
+  rename(status = point.status) |>
+  filter(point.statesAW == "Foraging") |>    #Reduce to records when on-water
+  group_by(colony, status) |>
+  summarize(nBirds_oilExp = length(unique(BirdID)),
+            .groups = "drop_last")
+
+exposures <- left_join(bird.status, oilFP, by = c("colony", "status")) |>
+  mutate(pBirds_oilFP = nBirds_oilFP/nBirds) |>
+  left_join(oilExp, by = c("colony", "status")) |>
+  mutate(pBirds_oilExp = nBirds_oilExp/nBirds)
+
+```
+
+## Birds exposed to light
+
+Reduce to records within light footprint. Allow for differences in the average light footprint at NL and former NS facilities. Then reduce to records within these light footprints at night.
+
+Summarize proportion in the light footprint vs exposed (in light footprint at night) separately.
+
+```{r}
+
+# Different size light footprints for NS and NL colonies
+# Use average light basin size for NS and NL from Gjerdrum et al. 2021
+# Light basin: 1.2 km for NS, 5.3 km for NL
+
+rad.light.NL <- sqrt(((86+59+123)/3)/pi)
+rad.light.NS <- sqrt(((2+14+1+5+1)/5)/pi)
+
+# All trips in light FP at any time of day
+out <- out |>
+  mutate(platRegion = ifelse(point.pnt.name %in% c("SeaRose FPSO", "Hibernia Platform", "Terra Nova FPSO", "Hebron Platform"), "NL", "NS"),
+         inLFP = ifelse(platRegion == "NL" & min.dist <= rad.light.NL, "yes",
+                       ifelse(platRegion == "NS" & min.dist <= rad.light.NS, "yes", "no")))
+
+lightFP <- out |>
+  rename(status = point.status) |>
+  filter(inLFP == "yes") |>
+  group_by(colony, status) |>
+  summarize(nBirds_lightFP = length(unique(BirdID)),
+            .groups = "drop_last")
+
+lightExp <- out |>
+  rename(status = point.status) |>
+  filter(inLFP == "yes" & point.tod == "night") |>
+  group_by(colony, status) |>
+  summarize(nBirds_lightExp = length(unique(BirdID)),
+            .groups = "drop_last")
+
+exposures <- exposures |>
+  left_join(lightFP, by = c("colony", "status")) |>
+  mutate(pBirds_lightFP = nBirds_lightFP/nBirds) |>
+  left_join(lightExp, by = c("colony", "status")) |>
+  mutate(pBirds_lightExp = nBirds_lightExp/nBirds)
+
+```
+
+### Save exposure summary
+
+```{r}
+
+saveRDS(exposures, here::here("output_data/platform_proximity/PlatformProximity_byBird_allExposures.rds"))
+write.csv(exposures, here::here("output_data/platform_proximity/PlatformProximity_byBird_allExposures.csv"), row.names = F)
+
+```
+
+## Multiple exposures per trip
+
+Identify birds with more than one close passage or exposure per trip. Summarize the mean number of exposures per trip by colony and breeding stage.
+
+```{r}
+
+# Add column to indicate exposure type
+out <- out |>
+  mutate(lightExp = ifelse(inLFP == "yes" & point.tod == "night", "yes", "no"),
+         oilExp = ifelse(point.statesAW == "Foraging", "yes", "no")) |>
+  arrange(ID, point.datetime, point.pnt.name)
+  
+out <- out |> 
+  group_by(ID, point.pnt.name, point.datetime) |>
+  slice_min(min.dist, n = 1, with_ties = T)
+
+# Add whether trip is complete or not
+trips <- trk |>
+  select(ID, tripType) |>
+  distinct()
+  
+out <- left_join(out, trips, by = "ID")
+
+# Number of exposures per trip - all trips
+nExp_trip <- out |>
+  rename(status = point.status) |>
+  group_by(colony, status, ID) |>
+  summarize(nTrip_OFP = n(),
+            nTrip_lightExp = sum(lightExp == "yes"),
+            nTrip_LFP = sum(inLFP == "yes"),
+            nTrip_oilExp = sum(lightExp == "yes"),
+            .groups = "drop_last")
+
+# Mean number of exposures per trip
+mean_OFP <- nExp_trip |>
+  group_by(colony, status) |>
+  summarize(n = n(),
+            mean = mean(nTrip_OFP),
+            min = min(nTrip_OFP),
+            max = max(nTrip_OFP),
+            SE = sd(nTrip_OFP)/sqrt(n))
+ 
+mean_oilExp <- nExp_trip |>
+  filter(nTrip_oilExp > 0) |>
+  group_by(colony, status) |>
+  summarize(n = n(),
+            mean = mean(nTrip_oilExp),
+            min = min(nTrip_oilExp),
+            max = max(nTrip_oilExp),
+            SE = sd(nTrip_oilExp)/sqrt(n))
+
+mean_LFP <- nExp_trip |>
+  filter(nTrip_LFP > 0) |>
+  group_by(colony, status) |>
+  summarize(n = n(),
+            mean = mean(nTrip_LFP),
+            min = min(nTrip_LFP),
+            max = max(nTrip_LFP),
+            SE = sd(nTrip_LFP)/sqrt(n))
+
+mean_lightExp <- nExp_trip |>
+  filter(nTrip_lightExp > 0) |>
+  group_by(colony, status) |>
+  summarize(n = n(),
+            mean = mean(nTrip_lightExp),
+            min = min(nTrip_lightExp),
+            max = max(nTrip_lightExp),
+            SE = sd(nTrip_lightExp)/sqrt(n))
+
+# Check: are there trips where a bird is exposed to both light and oil, in different instants?
+tt <- out |>
+  rename(status = point.status) |>
+  group_by(colony, status, ID) |>
+  summarize(nLight = sum(lightExp == "yes"),
+            nOil = sum(oilExp == "yes"),
+            nBoth = sum(lightExp == "yes" & oilExp == "yes"))
+# Only one case of both and only one record each for light and oil in that case.
+
+```
+
+## Number of exposed trips per bird
+
+Get number of exposures per trip, then numer of exposed trips per bird. 
+
+For exposed birds, also calculate the proportion of their trips on which they experienced exposures.
+
+Use complete trips only for this assessment.
+
+```{r}
+
+# Get number of exposures per complete trip
+tripsExp <- out |>
+  filter(tripType != "incomplete trip") |>
+  group_by(BirdID, ID) |>
+  summarize(nOFP = n(),
+            nOilExp = sum(oilExp == "yes"),
+            nLFP = sum(inLFP == "yes"),
+            nLightExp = sum(lightExp == "yes"))
+
+# Get number of exposed trips per bird
+birdsExp <- tripsExp |>
+  group_by(BirdID) |>
+  summarize(nOFP = sum(nOFP > 0),
+            nOilExp = sum(nOilExp > 0),
+            nLFP = sum(nLFP > 0),
+            nLightExp = sum(nLightExp >0))
+
+# Compare to number of complete trips for that bird
+trips_complete <- trk |>
+  select(colony, BirdID, ID, tripType) |>
+  distinct() |>
+  filter(tripType != "incomplete trip")
+
+tripsPerBird <- trips_complete |>
+  group_by(colony, BirdID) |>
+  summarize(totalTrips = n())
+
+birdsExp <- birdsExp |>
+  left_join(tripsPerBird, by = "BirdID") |>
+  mutate(pOFP = nOFP/totalTrips,
+         pOilExp = nOilExp/totalTrips,
+         pLFP = nLFP/totalTrips,
+         pLightExp = nLightExp/totalTrips)
+
+sumBirdsExp_pOFP <- birdsExp |>
+  group_by(colony) |>
+  summarize(mean = mean(pOFP),
+            sem = sd(pOFP)/sqrt(n()),
+            n = n())
+
+sumBirdsExp_pLFP <- birdsExp |>
+  filter(nLFP > 0) |>
+  group_by(colony) |>
+  summarize(mean = mean(pLFP),
+            sem = sd(pLFP)/sqrt(n()),
+            n = n())
+
+sumBirdsExp_pLightExp <- birdsExp |>
+  filter(nLightExp > 0) |>
+  group_by(colony) |>
+  summarize(mean = mean(pLightExp),
+            sem = sd(pLightExp)/sqrt(n()),
+            n = n())
+
+sumBirdsExp_pOilExp <- birdsExp |>
+  filter(nOilExp > 0) |>
+  group_by(colony) |>
+  summarize(mean = mean(pOilExp),
+            sem = sd(pOilExp)/sqrt(n()),
+            n = n())
+
+```

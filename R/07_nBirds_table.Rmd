@@ -1,0 +1,413 @@
+---
+title: "Phenology for breeding SDM"
+author: "Katharine Studholme"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)
+
+renv::restore(lockfile = here::here('renv.lock'))
+
+library(tidyr)
+library(dplyr)
+library(readxl)
+library(ggplot2)
+library(lubridate)
+
+```
+
+This script uses hatch dates (direct observation or estimates from chick measurements) from a range of colonies to estimate the proportion of adult breeding birds from each colony that are at sea on the 15th of each month between June and September. When birds are incubating their eggs, only one parent is at sea at a time, but when birds are rearing chicks, both parents are at sea, making only brief visits to their nest burrow to deliver food. 
+
+These proportions are further refined to estimates of the number of birds at sea during the day vs at night and in on-water (foraging, resting) vs in-air (transit) behavioural states for each colony, using the stationary state probabilities from our HMM.
+
+All calculations assume 100% of breeding population breeds, and all pairs have 100% success rate. No adjustments were made for the transition of some proportion of the population out of incubation or chick-rearing duties/behavior patterns across time due to breeding failure. For many sites, we have access to breeding success data but only in the form of a static proportion (x% fail at egg stage, Y% fail at chick state), with no sense of how these failures are distributed through time. There is also the problem of what behavior type to give failed breeders even if we identified their numbers since the only behavior patterns we can use in our model are those of incubating or chick-rearing birds. This is somewhat reasonable because breeding success is know to be high for Leach's storm-petrel.
+
+# Setup
+
+```{r df-init}
+
+colonies <- readRDS(here::here("input_data/envir/colonies.RDS")) |>
+  mutate(region = ifelse(collat > 46.5, "Newfoundland", "Scotian Shelf")) |>
+  select(region, colony, population)
+
+colony <- colonies$colony
+month <- c("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
+tod <- c("night", "day")
+
+ph <- expand.grid(colony = colony, month = month, tod = tod) |>
+  left_join(colonies, by = "colony") |>
+  select(region, colony, population, month, tod) |>
+  arrange(region, colony, population, month, tod)
+
+```
+
+# Read hatch date estimates
+
+```{r}
+
+hatch <- read.csv(here::here("raw_data/LHSP_allHatchEstimates.csv"))
+
+```
+
+# Summarize hatch data 
+
+Are there differences in phenology among regions that indicate we should calculate the proportion of birds at sea differently for Newfoundland and the Scotian Shelf? Yes - We found a 5 (weighted mean) to 6 (lmer) day difference (see subsections below).
+
+We also noted that sample sizes are very unbalanced across colonies and years. When summarizing at the colony level, we give equal weight to each year of data. When summarizing at the regional level (Newfoundland vs Scotian Shelf), we weight the data from each colony by population size (colony sizes vary widely). This is intended to make our results reflect what a typical year would look like across the region, where larger colonies contribute more. Since we only have phenology data from a subset of our 16 prediction colonies, we perform this weighting using the sum of the breeding populations in our study that are adjacent to each monitored colony:
+
+Baccalieu = Baccalieu + Penguin
+Gull = Gull + Great
+Middle Lawn = Middle Lawn + Grand Colombier + Corbin + Green
+Country = Country + Scatarie + Long + Little White
+Bon Portage = Bon Portage
+Kent = Kent
+Machias Seal = Great Duck + Little Duck
+
+## Weighted mean
+
+```{r}
+
+# Summarize with proper weighting (very unbalanced sample sizes)
+hatchMean_yr <- hatch |>
+  group_by(region, colony, year) |>
+  summarise(se = sd(doy) / sqrt(n()),
+            mean_hatch = mean(doy),
+            median_hatch = median(doy),
+            .groups = "drop")
+
+hatchMean_col <- hatchMean_yr |>
+  group_by(region, colony) |>
+  summarise(se = sd(mean_hatch) / sqrt(n()),
+            mean_hatch = mean(mean_hatch),
+            median_hatch = median(median_hatch),
+            .groups = "drop")
+
+# Prep to weight colonies by the number of birds that they will represent
+col_weights <- colonies |>
+  mutate(col_group = case_when(
+    colony %in% c("Baccalieu", "Penguin") ~ "Baccalieu",
+    colony %in% c("Gull", "Great") ~ "Gull",
+    colony %in% c("Middle Lawn", "Green", "Corbin", "Grand Colombier") ~ "Middle Lawn",
+    colony %in% c("Country", "Scatarie", "Long", "Little White") ~ "Country",
+    colony %in% c("Great Duck", "Little Duck") ~ "Machias Seal",
+    TRUE ~ colony
+    )
+  ) |>
+  group_by(col_group) |>
+  summarize(group_population = sum(population))
+
+hatchMean_reg <- hatchMean_col |>
+  left_join(col_weights, by = c("colony" = "col_group")) |>
+  group_by(region) |>
+  summarise(mean_hatch_w = weighted.mean(mean_hatch, w = group_population),
+            se_w = sqrt(sum(group_population * (mean_hatch - mean_hatch_w)^2) / sum(group_population)), # se for weighted mean
+            median_hatch_w = matrixStats::weightedMedian(median_hatch, w = group_population),
+            .groups = "drop")
+
+```
+
+## Mixed effects model
+
+For the mixed effects model (lmer), unequal sample sizes are handled automatically. Estimates a regional mean without over-weighting dense groups. Lets you quantify variance at each level. (1 | colony:year) allows extra variation specific to each colony-year combination, seems reasonable for large geographic spread
+
+```{r, eval = F}
+
+library(lme4)
+model <- lmer(doy ~ 1 + region + (1 | colony) + (1 | year) + (1 | colony:year), data = hatch)
+fixef(model)          # intercept is mean for reference region
+library(emmeans)
+emm <- emmeans(model, ~ region)
+pairs(emm)
+
+```
+
+# Proportion hatched by 15th of each month
+
+As with calculation of means, above, calculate proportions at each level of year and colony to avoid bias due to very unequal sample sizes. Weight colony groups by population size.
+
+```{r hatch-addDat}
+
+# Proportion by colony and year
+
+hatchProp_yr <- hatch |>
+  group_by(region, colony, year) |>
+  summarize(
+    May = mean(doy <= 135),
+    June = mean(doy <= 166),
+    July = mean(doy <= 196),
+    August = mean(doy <= 227),
+    September = mean(doy <= 258),
+    October = mean(doy <= 288),
+    November = mean(doy <= 319),
+    December = mean(doy <= 349),
+    .groups = "drop"
+  )
+
+# Proportion by colony, equal weight years
+
+hatchProp_col <- hatchProp_yr |>
+  group_by(region, colony) |>
+  summarize(across(May:December, mean), .groups = "drop")
+
+# Proportion by region, weight colony by group population
+
+hatchProp_reg <- hatchProp_col |>
+  left_join(col_weights, by = c("colony" = "col_group")) |>
+  group_by(region) |>
+  summarize(
+    January = 0,
+    February = 0,
+    March = 0,
+    April = 0,
+    across(May:December,
+                   ~ weighted.mean(.x, w = group_population)),
+            .groups = "drop")
+
+# Add results to phenology matrix
+hatchProp_reg <- hatchProp_reg |>
+  pivot_longer(January:December, names_to = "month", values_to = "p_hatch")
+
+ph <- ph |>
+  left_join(hatchProp_reg, by = c("region", "month"))
+
+```
+
+# Proportion layed, est. from Hatch
+
+From Birds of the World:
+
+Earliest laying date on Great Island, Newfoundland, 26 May; on Little Duck Island, Maine, 14 May (RGB).
+Kent Island, mean lay date is 19 June ± 13 d. (RAM)
+On Bon Portage Island, Nova Scotia, from 2011–2015, mean annual lay date ranged from 10–20 June (overall mean: 15 June ± 5 d SD; 208).
+
+Incubation in 26 burrows on Great Island, Newfoundland, where laying and hatching were determined to nearest day, lasted 37–50 d (mean 43.3 d ± 0.5 SD; RGB). On Kent Island, New Brunswick, incubation lasted 42.6 ± 4.5 d (RAM).
+
+Used *43 days* as incubation period to back-calculate lay dates.
+
+Note that for Kent, this gave us slightly early results (mean 7 June instead of 19 June). Earliest lay for MSI est at 12 May, consistent with 14 May above.
+
+```{r lay-est}
+
+lay <- hatch |>
+  mutate(doy = doy - 43) |>
+  select(region, colony, year, doy)
+
+# Proportion by colony and year
+layProp_yr <- lay |>
+  group_by(region, colony, year) |>
+  summarize(
+    May = mean(doy <= 135),
+    June = mean(doy <= 166),
+    July = mean(doy <= 196),
+    August = mean(doy <= 227),
+    September = mean(doy <= 258),
+    October = mean(doy <= 288),
+    November = mean(doy <= 319),
+    December = mean(doy <= 349),
+    .groups = "drop"
+  )
+
+# Proportion by colony, equal weight years
+layProp_col <- layProp_yr |>
+  group_by(region, colony) |>
+  summarize(across(May:December, mean), .groups = "drop")
+
+# Proportion by region, weight colony by group population
+layProp_reg <- layProp_col |>
+  left_join(col_weights, by = c("colony" = "col_group")) |>
+  group_by(region) |>
+  summarize(
+    January = 0,
+    February = 0,
+    March = 0,
+    April = 0,
+    across(May:December,
+           ~ weighted.mean(.x, w = group_population)),
+    .groups = "drop")
+
+# Add results to phenology matrix
+layProp_reg <- layProp_reg |>
+  pivot_longer(January:December, names_to = "month", values_to = "p_lay")
+
+ph <- ph |>
+  left_join(layProp_reg, by = c("region", "month"))
+
+```
+
+# Proportion fledged, est. from Hatch
+
+From Birds of the World:
+
+Earliest documented fledging date on Great Island, Newfoundland 10 September; majority fledge mid-September to late October (RGB). Latest fledging date at Kent Island, New Brunswick 27 November (132). Earliest and latest fledging dates in Maine 2 September and 7 November, respectively (latest date estimate based on known hatch dates and average fledging age of 68 d); mean fledging date over 5 years: 25 September (RGB). On Bon Portage Island, Nova Scotia, earliest and latest fledgling dates for 2010–2015 are 1 September and 3 November, respectively (mean 25 September, ILP).
+
+Chicks are generally brooded by 1 adult for first 2–12 d (mean 6 d) after hatching (25, RGB). Could make adjustment to number of birds at sea due to brooding but chose not to.
+
+Fledge age Great Island 67.1 ± 4.6 (56–79)
+Fledge age Kent Island 64.5 ± 2.8 (59–70)
+
+Used *66 days* as hatch to fledge period to estimate fledge dates.
+
+```{r fledge-est}
+
+fledge <- hatch |>
+  mutate(doy = doy + 66)|>
+  select(region, colony, year, doy)
+
+# Proportion by colony and year
+fledgeProp_yr <- fledge |>
+  group_by(region, colony, year) |>
+  summarize(
+    May = mean(doy <= 135),
+    June = mean(doy <= 166),
+    July = mean(doy <= 196),
+    August = mean(doy <= 227),
+    September = mean(doy <= 258),
+    October = mean(doy <= 288),
+    November = mean(doy <= 319),
+    December = mean(doy <= 349),
+    .groups = "drop"
+  )
+
+# Proportion by colony, equal weight years
+fledgeProp_col <- fledgeProp_yr |>
+  group_by(region, colony) |>
+  summarize(across(May:December, mean), .groups = "drop")
+
+# Proportion by region, weight colony by group population
+fledgeProp_reg <- fledgeProp_col |>
+  left_join(col_weights, by = c("colony" = "col_group")) |>
+  group_by(region) |>
+  summarize(
+    January = 0,
+    February = 0,
+    March = 0,
+    April = 0,
+    across(May:December,
+           ~ weighted.mean(.x, w = group_population)),
+    .groups = "drop")
+
+# Add results to phenology matrix
+fledgeProp_reg <- fledgeProp_reg |>
+  pivot_longer(January:December, names_to = "month", values_to = "p_fledge")
+
+ph <- ph |>
+  left_join(fledgeProp_reg, by = c("region", "month"))
+
+```
+
+# Proportion at sea
+
+Not influenced by proportion fledged.
+
+```{r pAtSea}
+
+ph <- ph |>
+  mutate(p_preBr = 1 - p_lay,
+         
+         p_inc = case_when(
+           p_lay == 0 ~ 0,
+           p_hatch == 1 ~ 0,
+           TRUE ~ p_lay - p_hatch),
+         
+         p_chr = case_when(
+           p_hatch == 0 ~ 0,
+           p_hatch == 1 & p_fledge == 0 ~ 1,
+           TRUE ~ p_hatch - p_fledge),
+         
+         p_postBr = p_fledge,
+         
+         p_br = p_inc + p_chr,
+         p_nonBr = 1 - p_inc - p_chr,
+         
+         # Number of birds at sea within the breeding region
+         nBreed_atSea = population*(p_inc/2 + p_chr),
+         nInc_atSea = population*(p_inc/2), # same as n in burrow
+         nChr_atSea = population*p_chr) |>
+  
+  select(region, colony, population, month, tod,
+         p_lay, p_hatch, p_fledge,
+         p_preBr, p_inc, p_chr, p_postBr,
+         nBreed_atSea, nInc_atSea, nChr_atSea)
+
+```
+
+# Account for behavioral state
+
+Use stationary state probabilities from our HMM (with variables matching categorical SDM predictors (region, night/day, breeding status)) to further split out the number of birds at sea from each colony in each month according to breeding status, time of day, and behaviour/risk category. We want to highlight where birds are most at risk from oiling (on-water: resting on the water, foraging) as opposed to where they are at little risk of oiling (in-air: transiting and engaging in area restricted search). The on-water state is called 'intensive search' in the HMM and 'foraging' in the output dataset. The in-air category is a combination of the 'transit' and 'extensive search' states in the HMM and is called 'transit' in the output dataset.
+
+pState ~ region + nightday + status
+
+Will add column for night/day and column for nBirds in intensive foraging.
+
+```{r hmm_stationary_probs}
+
+hmmSP <- readRDS(here::here("input_data/HMM_stationary_states.rds")) |>
+  rename(pForage_HMMsp = `Intensive search`) |>
+  select(-c('Transit', 'Extensive search')) |>
+  reshape(idvar = c("region", "tod"), timevar = "status", sep = "_", direction = "wide") |>
+  rename(pForage_HMMsp_inc = pForage_HMMsp_incubation,
+         pForage_HMMsp_chr = `pForage_HMMsp_chick-rearing`)
+
+# Join to phenology dataset (ph)
+
+ph <- ph |>
+  left_join(hmmSP, by = c("region", "tod"))
+
+# Get number of birds foraging at sea by colony, breeding stage:month, and time of day
+
+ph <- ph |>
+  mutate(nBirds_atSea_forage_inc = nInc_atSea * pForage_HMMsp_inc,
+         nBirds_atSea_transit_inc = nInc_atSea - nBirds_atSea_forage_inc,
+         
+         nBirds_atSea_forage_chr = nChr_atSea * pForage_HMMsp_chr,
+         nBirds_atSea_transit_chr = nChr_atSea - nBirds_atSea_forage_chr)
+
+```
+
+Make summary table for paper. Save proportions for all colonies within a region. Simplify at nest, incubation (on water, in air), chick rearing (on water, in air), and nonbreeding.
+
+```{r summary-table}
+
+if (dir.exists(here::here('output_data/phenology')) == FALSE) dir.create(here::here('output_data/phenology'), recursive = T)
+
+tab <- ph |>
+  filter(colony %in% c("Baccalieu", "Bon Portage")) |>
+  filter(month %in% c("June", "July", "August", "September")) |>
+  mutate(inc_p_nest = p_inc/2,
+         inc_p_water = (p_inc/2)*pForage_HMMsp_inc,
+         inc_p_air = (p_inc/2)*(1-pForage_HMMsp_inc),
+         chr_p_water = p_chr*pForage_HMMsp_chr,
+         chr_p_air = p_chr*(1-pForage_HMMsp_chr),
+         nonBr = p_preBr + p_postBr) |>
+  select(region, month, tod, inc_p_nest, inc_p_water, inc_p_air, chr_p_water, chr_p_air, nonBr)
+
+write.csv(tab, here::here("output_data/phenology/Table_pBreedStagexBehavior_GPSmodel.csv"), row.names = F)
+write.csv(tab, here::here("output_data/plots_man/Table_pBreedStagexBehavior_GPSmodel.csv"), row.names = F)
+
+```
+
+Now we make the final, simplified table to use when converting SDM predictions to predicted number of birds.
+
+We change to long table format, adding column for behaviour and status. Status will include incubation, chick rearing, and incubation + non breeding.
+
+```{r summary-nBirds}
+
+s <- ph |>
+  select(region, colony, month, tod, nBirds_atSea_forage_inc:nBirds_atSea_transit_chr)
+
+sL <- s |> gather(condition, nAtSea, nBirds_atSea_forage_inc:nBirds_atSea_transit_chr) |>
+  mutate(status = ifelse(grepl("inc", condition), "incubation", "chick-rearing"),
+         behavior = ifelse(grepl("transit", condition), "transit", "foraging")) |>
+  select(region, colony, month, tod, status, behavior, nAtSea) 
+
+# Don't need nonbreeding months
+sL <- sL |>
+  filter(month %in% c("June", "July", "August", "September"))
+
+saveRDS(sL, here::here("input_data/nBirds_atSea.rds"))
+
+```

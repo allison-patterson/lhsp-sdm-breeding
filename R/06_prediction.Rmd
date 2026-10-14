@@ -1,0 +1,277 @@
+---
+title: "prediction"
+author: "Allison Patterson"
+date: "`r Sys.Date()`"
+output: html_document
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "output_html") })
+---
+
+This script uses the BART model to make monthly predictions for each colony for foraging, transit, day and night.
+
+```{r setup, include=FALSE}
+
+library(ggplot2)
+require("knitr")
+knitr::opts_chunk$set(echo = T, eval = T, message = F, warning = F)# Load functions
+source(here::here("R/functions.R"), echo = F)
+library(doParallel)
+Sys.setenv(JAVA_HOME=java_loc)
+options(java.parameters = c("-XX:+UseAllWindowsProcessorGroups","-Xmx10g")) 
+library(bartMachine)
+
+colgrid <- readRDS(paste0(envir,'/colonies.RDS'))
+
+```
+
+
+### Predict long-term monthly mean (ltm) from SDM
+
+Load model and creates output folder.
+
+``` {r set-up-ltm}
+
+if (dir.exists(here::here('output_data/ltm_bart_pred')) == FALSE){
+  dir.create(here::here('output_data/ltm_bart_pred'))
+} 
+
+# load model
+mod <- readRDS(here::here('output_data/bart_model_full.RDS'))
+
+```
+
+Create a grid with all combinations of month, status, state, daynight, and colony.
+
+```{r get-grids-ltm1}
+
+my_dates <- paste0('ltm_', month.abb[6:9])
+
+pgrid <- expand.grid(
+  status = unique(mod$X$status),
+  state = unique(mod$X$state),
+  daynight = unique(mod$X$daynight),
+  colony = colgrid$colony,
+  date = my_dates
+)
+
+```
+
+Load the static rasters and the colony distance rasters. Pull the grid coordinates for prediction from the static raster.
+
+```{r get-grids-ltm2}
+
+sr <- terra::rast(paste0(envir, '/static_rast.nc'))
+cr <- terra::rast(list.files(paste0(envir, '/colonydist'), full.names = T))
+cr <- terra::ifel(is.na(cr), NA, cr)
+pred_coord <- terra::crds(sr, na.rm = T)
+
+```
+
+Load the environmental data and colony data for the first row in pgrid.
+
+```{r get-grids-ltm3}
+
+# base envir_data
+envir_dat <- data.frame(pred_coord, date = pgrid$date[1]) |> 
+  sf::st_as_sf(coords = c('x', 'y'), crs = 4326, remove = F) |> 
+  get_preds(stat_rast = sr, col_rast = cr, dyn_dir = paste0(envir, '/ltm_extraction'),
+            daynight = FALSE, convar = FALSE, static = TRUE,  coldist = FALSE, dyn = TRUE ) 
+
+# base colony data
+col_dat <- data.frame(pred_coord, colgrid[1,]) |>
+  sf::st_as_sf(coords = c('x', 'y'), crs = 4326, remove = F) |> 
+  get_preds(stat_rast = sr, col_rast = cr, dyn_dir = paste0(envir, '/ltm_extraction'),
+            daynight = FALSE, convar = TRUE, static = FALSE,  coldist = TRUE, dyn = FALSE) 
+
+```
+
+Loop through pgrid generating predictions. Update the colony distance data when the colony changes and update the environmental data when the date changes. Pgrid is set-up to minimize the number of times we have to extract new environmental data.
+
+This was optimized to work efficiently on my machine, but the RAM allowance for JAVA and number of cores may need to be altered in different computing environments. Increasing the number of cores used by Bart for prediction helps to speed up the process. With 30 cores it takes about 2 min per prediction and uses 70% of the workstation CPU. If there is nothing else running on the workstation you can go up to 60 cores, but there is not much advantage in processing time above about 30.
+
+```{r pred-dyn-ltm}
+
+# Using multiple cores through bartMachine greatly increases prediction speed
+bartMachine::set_bart_machine_num_cores(30) 
+
+for (i in 1:nrow(pgrid)) {
+  
+  od <- here::here(paste0('output_data/ltm_bart_pred/',pgrid$colony[i]))
+  if (dir.exists(od) == FALSE) dir.create(od)
+  
+  of <- paste0(od,'/',pgrid$colony[i],'_',
+               gsub('ltm_','',pgrid$date[i]),'_',
+               pgrid$status[i],'_',
+               pgrid$state[i],'_',
+               pgrid$daynight[i],'.tif')
+  
+  if (file.exists(of) == FALSE) {
+    
+    if (pgrid$date[i] != envir_dat$date[1]) {
+      envir_dat <- data.frame(pred_coord, date = pgrid$date[i]) |>
+        sf::st_as_sf(coords = c('x', 'y'), crs = 4326, remove = F) |> 
+        get_preds(stat_rast = sr, col_rast = cr, dyn_dir = paste0(envir, '/ltm_extraction'),
+                  daynight = FALSE, convar = FALSE, static = TRUE,  coldist = FALSE, dyn = TRUE ) 
+    }
+    
+    # get colony data if needed
+    if (pgrid$colony[i] != col_dat$colony[1]) {
+      col_dat <- data.frame(pred_coord, colony = pgrid$colony[i]) |>
+        dplyr::inner_join(colgrid, by = 'colony') |> 
+        sf::st_as_sf(coords = c('x', 'y'), crs = 4326, remove = F) |> 
+        get_preds(stat_rast = sr, col_rast = cr, dyn_dir = paste0(envir, '/ltm_extraction'),
+                  daynight = FALSE, convar = TRUE, static = FALSE,  coldist = TRUE, dyn = FALSE)
+    }
+    
+    # add conditional data
+    all_data <- col_dat |> 
+      sf::st_drop_geometry() |> 
+      dplyr::select(-x, - y) |> 
+      cbind(sf::st_drop_geometry(envir_dat)) |> 
+      na.omit() |> 
+      dplyr::inner_join(pgrid[i,], by = c('colony', 'date'))
+    
+    # get predictions
+    pp <- bartMachine::bart_machine_get_posterior(mod, all_data[,names(mod$X)])
+    
+    # create raster
+    r <- terra::rast(cbind(all_data[, c("x","y")], pp$y_hat_posterior_samples),
+                     type="xyz", crs = 'epsg:4326')
+    
+    # save raster
+    terra::writeRaster(r, here::here(of),
+                       overwrite=TRUE,
+                       gdal=c("of=COG",
+                              "COPY_SRC_OVERVIEWS=YES",
+                              "COMPRESS=LZW"),
+                       datatype='INT1U',
+                       filetype='COG',
+                       scale = 1/254)
+    
+    print(paste('Finished:', of))
+  } else print(paste('Skipping:', of))
+}
+
+
+```
+
+### Monthly predictions by year - extra code
+
+This section makes predictions for the monthly values of environmental predictors from 2014-2023. Process is the same as above, except that the pgrid is 10 times bigger (5120 iterations to predict) and will take at least a week to run at 2 min per iteration.
+
+*This was not run as part of the manuscript but has been left in for reference.*
+
+``` {r set-up}
+
+if (dir.exists(here::here('output_data/bart_pred')) == FALSE){
+  dir.create(here::here('output_data/bart_pred'))
+} 
+
+# load model
+mod <- readRDS(here::here('output_data/bart_model_full.RDS'))
+
+```
+
+```{r get-grids}
+
+my_dates <- c()
+for (y in 2014:2023) {
+  my_dates <- c(my_dates, 
+                seq.Date(as.Date(paste0(y,'-06-01 00:00')), as.Date(paste0(y, '-09-30 00:00')), by = '1 month'))
+}
+my_dates <- as.Date(my_dates)
+
+pgrid <- expand.grid(
+  status = unique(mod$X$status),
+  state = unique(mod$X$state),
+  daynight = unique(mod$X$daynight),
+  colony = colgrid$colony,
+  date = my_dates
+) 
+
+sr <- terra::rast(paste0(envir, '/static_rast.nc'))
+cr <- terra::rast(list.files(paste0(envir, '/colonydist'), full.names = T))
+cr <- terra::ifel(is.na(cr), NA, cr)
+pred_coord <- terra::crds(sr, na.rm = T)
+
+# base envir_data
+envir_dat <- data.frame(pred_coord,
+                        date = my_dates[1]
+) |> sf::st_as_sf(coords = c('x', 'y'), crs = 4326, remove = F) |> 
+  get_preds(stat_rast = sr, col_rast = cr, dyn_dir = paste0(envir, '/monthly_extraction'),
+            daynight = FALSE, convar = FALSE, static = TRUE,  coldist = FALSE, dyn = TRUE ) 
+
+# base colony data
+col_dat <- data.frame(pred_coord, colgrid[1,]) |>
+  sf::st_as_sf(coords = c('x', 'y'), crs = 4326, remove = F) |> 
+  get_preds(stat_rast = sr, col_rast = cr, dyn_dir = paste0(envir, '/monthly_extraction'),
+            daynight = FALSE, convar = TRUE, static = FALSE,  coldist = TRUE, dyn = FALSE) 
+
+```
+
+
+```{r pred-dyn}
+
+# Using multiple cores through bartMachine greatly increases prediction speed
+bartMachine::set_bart_machine_num_cores(40) 
+
+for (i in 1:nrow(pgrid)) {
+  
+  od <- here::here(paste0('output_data/bart_pred/',pgrid$colony[i]))
+  if (dir.exists(od) == FALSE) dir.create(od)
+  
+  of <- paste0(od,'/',pgrid$colony[i],'_',
+               gsub('-','',pgrid$date[i]),'_',
+               pgrid$status[i],'_',
+               pgrid$state[i],'_',
+               pgrid$daynight[i],'.tif')
+  
+  if (file.exists(of) == FALSE) {
+    
+    if (pgrid$date[i] != envir_dat$date[1]) {
+      envir_dat <- data.frame(pred_coord, date = pgrid$date[i]) |>
+        sf::st_as_sf(coords = c('x', 'y'), crs = 4326, remove = F) |> 
+        get_preds(stat_rast = sr, col_rast = cr, dyn_dir = paste0(envir, '/monthly_extraction'),
+                  daynight = FALSE, convar = FALSE, static = TRUE,  coldist = FALSE, dyn = TRUE ) 
+    }
+    
+    # get colony data if needed
+    if (pgrid$colony[i] != col_dat$colony[1]) {
+      col_dat <- data.frame(pred_coord, colony = pgrid$colony[i]) |>
+        dplyr::inner_join(colgrid, by = 'colony') |> 
+        sf::st_as_sf(coords = c('x', 'y'), crs = 4326, remove = F) |> 
+        get_preds(stat_rast = sr, col_rast = cr, dyn_dir = paste0(envir, '/monthly_extraction'),
+                  daynight = FALSE, convar = TRUE, static = FALSE,  coldist = TRUE, dyn = FALSE)
+    }
+    
+    # add conditional data
+    all_data <- col_dat |> 
+      sf::st_drop_geometry() |> 
+      dplyr::select(-x, - y) |> 
+      cbind(sf::st_drop_geometry(envir_dat)) |> 
+      na.omit() |> 
+      dplyr::inner_join(pgrid[i,], by = c('colony', 'date'))
+    
+    # get predictions
+    pp <- bartMachine::bart_machine_get_posterior(mod, all_data[,names(mod$X)])
+    
+    # create raster
+    r <- terra::rast(cbind(all_data[, c("x","y")], pp$y_hat_posterior_samples),
+                     type="xyz", crs = 'epsg:4326')
+    
+    # save raster
+    terra::writeRaster(r, here::here(of),
+                       overwrite=TRUE,
+                       gdal=c("of=COG",
+                              "COPY_SRC_OVERVIEWS=YES",
+                              "COMPRESS=LZW"),
+                       datatype='INT1U',
+                       filetype='COG',
+                       scale = 1/254)
+    
+    print(paste('Finished:', of))
+  } else print(paste('Skipping:', of))
+}
+
+
+```
