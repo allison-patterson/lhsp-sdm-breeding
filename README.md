@@ -34,7 +34,7 @@ Scripts are listed in the order they are run.
 
 Before using the scripts contained in this repository, you must open `template.config.yml`, replace the temporary filepaths and JDK version number with your own, then save the revised file as `config.yml`.
 
-Running the R/functions.R script will set-up your environment to use JDK in running the BART models and creating a python virtual environment for accessing oceanographic variables from Copernicus Marine Service.
+Running the R/functions.R script will set-up your environment to use JDK in running the BART models and create a python virtual environment for accessing oceanographic variables from Copernicus Marine Service.
 
 | File | Description |
 |---|---|
@@ -72,11 +72,6 @@ Files created in Step 1 are included in 'input_data/' for anyone who is only int
 |---|---|
 | `09_prep_risk_polys.Rmd` | Generates 1) a shapefile of current offshore petroleum lease areas and 2) a shapefile including only production and exploration licenses for use in the risk exposure case studies. |
 | `10_platform_proximity.Rmd` | Calculates for each foraging trip the single closest passage to an offshore petroleum production installation and all passages within any light or oil spill footprint of these facilities. Determines whether these passages occurred under conditions that could result in exposure to light or oil. |
-
-### Step 5: Outputs
-
-| File | Description |
-|---|---|
 | `11_results_summaries.Rmd` | Generates the summaries used in the paper. |
 | `12_manuscript_figures.Rmd` | Produces the figures included in the paper. |
 
@@ -137,13 +132,13 @@ Hoeg R, Pollet I, Shutler D, Hedd A. 2026. Data from: Study "Leach's storm-petre
 **Country Island:**
 Rock JC, Gjerdrum C, Ronconi RA, Wilhelm SI, Wong SNP, Hedd A. 2026. Data from: Study "Leach's storm-petrel GPS - Country Is. - Atlantic Canada - 2017-2022". Movebank Data Repository. <https://doi.org/10.5441/001/1.760>
 
-**Gull Island**
+**Gull Island:**
 Hedd A, Collins SM, Cunningham JT, Montevecchi WA, Robertson GJ, Wilhelm SI. 2026. Data from: Study "Leach's storm-petrel GPS - Gull Is. (Witless Bay) - Atlantic Canada - 2016-2023". Movebank Data Repository. <https://doi.org/10.5441/001/1.761>
 
 **Kent Island:**
 Jones PL, Ronconi RA, McFarlane Tranquilla LA, Wilhelm SI, Wong SNP, Hedd A. 2026. Data from: Study "Leach's storm-petrel GPS - Kent Is. - Atlantic Canada - 2018-2022". Movebank Data Repository. <https://doi.org/10.5441/001/1.762>
 
-**Middle Lawn Island**
+**Middle Lawn Island:**
 Studholme KR, Cunningham JT, Hedd A. 2026. Data from: Study "Leach's storm-petrel GPS - Middle Lawn Is. - Atlantic Canada - 2022-2023". Movebank Data Repository. <https://doi.org/10.5441/001/1.763>
 
 ## Contact
