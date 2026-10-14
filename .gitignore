@@ -1,0 +1,28 @@
+*.Rproj.user
+*.Rproj
+*.Rhistory
+*.RData
+*.Ruserdata
+*.img
+*.png
+*.xml
+*.nc
+*.html
+*.tmp
+*.log
+bfg.jar
+.git.bfg-report
+notes/
+config.yml
+
+# ignore raw_data
+raw_data/
+
+# ignore input_data 
+input_data/
+
+# ignore output_data
+output_data/*
+scratch*
+plots/
+.Rproj.user
