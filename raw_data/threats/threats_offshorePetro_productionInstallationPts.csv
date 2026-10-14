@@ -1,0 +1,11 @@
+"Province","Activity","ID","LTR","Status","FirstOil","Operator","Licence1","Licence2","Licence3","Licence4","Licence5","lon","lat"
+"NL","Production Installation","Terra Nova FPSO","JDA","Off Station","January 20, 2002","Suncor Energy Inc.","PL 1002","PL 1003","PL 1004",NA,NA,-48.480921889512,46.4754691943848
+"NL","Production Installation","SeaRose FPSO","JDA","Production Operations","November 14, 2005","Cenovus Energy Inc.","PL 1006","PL 1007","PL 1008","PL 1009","PL 1010",-48.0152824162999,46.8068351669281
+"NL","Production Installation","Hibernia Platform","JDA","Production Operations","November 17, 1997","Hibernia Management and Development Company Ltd.","PL 1001","PL 1005","PL 1011",NA,NA,-48.7818627780873,46.7503455554819
+"NL","Production Installation","Hebron Platform","JDA","Production Operations","November 27, 2017","ExxonMobil Canada Properties","PL 1012",NA,NA,NA,NA,-48.4980705000672,46.5440661947795
+"Nova Scotia","Production Installation","Thebaud",NA,NA,NA,NA,NA,NA,NA,NA,NA,-60.19922,43.89122
+"Nova Scotia","Production Installation","Venture",NA,NA,NA,NA,NA,NA,NA,NA,NA,-59.58175,44.03328
+"Nova Scotia","Production Installation","North Triumph",NA,NA,NA,NA,NA,NA,NA,NA,NA,-59.85378,43.69906
+"Nova Scotia","Production Installation","Alma",NA,NA,NA,NA,NA,NA,NA,NA,NA,-60.68869,43.59642
+"Nova Scotia","Production Installation","South Venture",NA,NA,NA,NA,NA,NA,NA,NA,NA,-59.62739,43.99739
+"Nova Scotia","Production Installation","Deep Panuke",NA,NA,NA,NA,NA,NA,NA,NA,NA,-60.68837,43.8127
