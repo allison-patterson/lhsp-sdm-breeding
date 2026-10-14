@@ -1,8 +1,11 @@
-# atl_lhsp_gps_sdm
 
 This repository archives the analyses included in the following paper:
 
 > April Hedd, Katharine R. Studholme, Laura A. McFarlane Tranquilla, Joshua T. Cunningham, Gregory J. Robertson, Sydney M. Collins, David A. Fifield, Carina Gjerdrum, Rielle Hoeg, Patricia L. Jones, William A. Montevecchi, Ingrid L. Pollet, Isabeau Pratte, Jennifer C. Rock, Robert A. Ronconi, Dave Shutler, Sabina I. Wilhelm, Sarah N.P. Wong and Allison Patterson (2026). A species distribution model integrating at-sea behaviour, phenology, and population size to inform marine risk exposure for a threatened seabird during breeding. *Front. Mar. Sci.* 13:1950203.
+
+## Interactive results
+
+Leach's storm-petrel at-sea species distribution model predictions can be explored using this **[link](https://allison-patterson-lhsp-sdm-viz.share.connect.posit.cloud/)**.
 
 ## Contents
 
