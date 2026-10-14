@@ -34,6 +34,8 @@ Scripts are listed in the order they are run.
 
 Before using the scripts contained in this repository, you must open `template.config.yml`, replace the temporary filepaths and JDK version number with your own, then save the revised file as `config.yml`.
 
+Running the R/functions.R script will set-up your environment to use JDK in running the BART models and creating a python virtual environment for accessing oceanographic variables from Copernicus Marine Service.
+
 | File | Description |
 |---|---|
 | `functions.R` | Restore project environment (`renv`), set options, load commonly used values, create directories, and load custom helper functions sourced by the other scripts. |
@@ -46,6 +48,8 @@ Before using the scripts contained in this repository, you must open `template.c
 | `01_hidden_markov_model.Rmd` | Fits a 3-state Hidden Markov Model to classify at-sea behaviour. Compares models with all combinations of time of day, region, and breeding stage as predictors of the transition probabilities between states (no interactions). Selects best model by AIC, then generates 1) classified positions to feed into the SDM and 2) stationary state probabilities to use with breeding phenology data when estimating the number of birds at sea in each behavioural state. |
 
 ### Step 2: Species Distribution Model (SDM)
+
+Files created in Step 1 are included in 'input_data/' for anyone who is only interested in running the SDM portion of the analysis.
 
 | File | Description |
 |---|---|
